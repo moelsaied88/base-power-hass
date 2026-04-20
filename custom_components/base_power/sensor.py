@@ -110,30 +110,30 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
     ),
-    # Base returns `duration` as a float in MINUTES (confirmed against the
-    # app: 177 minutes ~= 3 hours "at current usage"). The prior version
-    # misread this because Base returns duration_data newest-first and we
-    # were picking position [-1] (the oldest point, often a tiny value).
+    # Base returns `duration` as a float in HOURS. Confirmed by matching a
+    # 2.95h reading against the app's "~3 hours at actual usage". The prior
+    # positional [-1] read in v0.2.0 and the unfiltered max() in v0.3.0 both
+    # grabbed junk zero-timestamp points; v0.3.2 filters those out.
     BasePowerSensorDescription(
         key="backup_runtime",
         name="Backup Runtime (at current usage)",
         icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_min"
+            "latest_duration_hours"
         ),
     ),
     BasePowerSensorDescription(
         key="backup_runtime_at_750w",
         name="Backup Runtime (at 750W low usage)",
         icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_at_750w_min"
+            "latest_duration_at_750w_hours"
         ),
     ),
 )
@@ -187,3 +187,24 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
             return self.entity_description.value_fn(data)
         except (KeyError, AttributeError, TypeError):
             return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose timeseries + freshness attributes for select sensors.
+
+        Lets users see Base's raw duration/power points directly in HA dev
+        tools so they can verify readings against the Base app.
+        """
+        data = self.coordinator.data
+        if not data:
+            return None
+        usage = data.get("usage") or {}
+        key = self.entity_description.key
+        if key == "home_power":
+            return {"latest_sample_ts": usage.get("latest_power_ts")}
+        if key in ("backup_runtime", "backup_runtime_at_750w"):
+            points = usage.get("duration_points") or []
+            if not points:
+                return None
+            return {"recent_points": points[-24:]}
+        return None

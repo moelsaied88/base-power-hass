@@ -658,18 +658,20 @@ class BasePowerClient:
                 "solar_to_home": float(resp.energy_usage_source.solar_to_home_kwh),
                 "storage_to_home": float(resp.energy_usage_source.storage_to_home_kwh),
             },
-            # Base returns these in MINUTES.
-            "latest_duration_min": _latest_by_time(
+            # Base returns these as floats in HOURS (confirmed against the
+            # "Estimated duration" chart in the Base app, which is scaled in
+            # hours and shows newest values ~3h matching our 2.95h reading).
+            "latest_duration_hours": _latest_by_time(
                 resp.duration_data, "duration"
             ),
-            "latest_duration_at_750w_min": _latest_by_time(
+            "latest_duration_at_750w_hours": _latest_by_time(
                 resp.duration_data, "duration_at_750w"
             ),
             "duration_points": [
                 {
                     "ts": ts(pt),
-                    "duration_min": float(pt.duration),
-                    "duration_at_750w_min": float(pt.duration_at_750w),
+                    "duration_hours": float(pt.duration),
+                    "duration_at_750w_hours": float(pt.duration_at_750w),
                 }
                 for pt in resp.duration_data
             ],
@@ -686,20 +688,24 @@ class BasePowerClient:
 def _latest_by_time(points: Any, field: str) -> float | None:
     """Return ``field`` from the point in ``points`` with the largest timestamp.
 
-    Handles proto repeated messages that may be returned newest-first or
-    oldest-first - we don't assume ordering.
+    Base's RPCs return time-series repeated fields and ordering is not
+    guaranteed. We can't rely on positional [-1]. Additionally some points
+    have a zero/unset timestamp which we treat as junk and ignore.
     """
 
     if not points:
         return None
 
     def ts_of(pt: Any) -> int:
-        t = getattr(pt, "time", None)
-        if t is None:
+        if not pt.HasField("time"):
             return 0
-        return int(getattr(t, "seconds", 0) or 0)
+        return int(pt.time.seconds)
 
-    newest = max(points, key=ts_of)
+    valid = [pt for pt in points if ts_of(pt) > 0]
+    candidates = valid or list(points)
+    if not candidates:
+        return None
+    newest = max(candidates, key=ts_of)
     val = getattr(newest, field, None)
     return float(val) if val is not None else None
 
