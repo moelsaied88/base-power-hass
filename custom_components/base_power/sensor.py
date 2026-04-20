@@ -36,12 +36,16 @@ class BasePowerSensorDescription(SensorEntityDescription):
 
 
 SENSORS: tuple[BasePowerSensorDescription, ...] = (
+    # stateOfEnergy is an integer Base exposes in their status RPC. It is NOT
+    # the public battery state-of-charge - the mobile/web app never displays a
+    # battery % - and its exact semantics (grid-services reserve index?) are
+    # undocumented. Surface it as-is but label it accordingly so users can
+    # build their own heuristics on top.
     BasePowerSensorDescription(
-        key="battery_soc",
-        name="Battery State of Charge",
-        icon="mdi:battery-high",
+        key="battery_state_of_energy",
+        name="Battery State of Energy",
+        icon="mdi:battery",
         native_unit_of_measurement=PERCENTAGE,
-        device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: data["status"].get("state_of_energy"),
     ),
@@ -108,34 +112,27 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
     ),
     BasePowerSensorDescription(
         key="backup_runtime",
-        name="Backup Runtime Estimate",
+        name="Backup Runtime (at current usage)",
         icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: _last_duration(data),
+        value_fn=lambda data: (data.get("usage") or {}).get(
+            "latest_duration_hours"
+        ),
     ),
     BasePowerSensorDescription(
         key="backup_runtime_at_750w",
-        name="Backup Runtime Estimate at 750W",
+        name="Backup Runtime (at 750W low usage)",
         icon="mdi:timer-sand",
-        entity_registry_enabled_default=False,
-        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: _last_duration_at_750w(data),
+        value_fn=lambda data: (data.get("usage") or {}).get(
+            "latest_duration_at_750w_hours"
+        ),
     ),
 )
-
-
-def _last_duration(data: dict[str, Any]) -> float | None:
-    points = ((data.get("usage") or {}).get("duration_points") or [])
-    return points[-1]["duration_min"] if points else None
-
-
-def _last_duration_at_750w(data: dict[str, Any]) -> float | None:
-    points = ((data.get("usage") or {}).get("duration_points") or [])
-    return points[-1]["duration_at_750w_min"] if points else None
 
 
 async def async_setup_entry(

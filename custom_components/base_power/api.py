@@ -620,12 +620,23 @@ class BasePowerClient:
             return int(t.seconds or 0)
 
         latest_power_w: float | None = None
+        latest_power_ts: int | None = None
         if resp.power_level_data:
-            last = resp.power_level_data[-1]
-            latest_power_w = float(last.power_to_home_kw) * 1000.0
+            # Don't assume list ordering - Base sometimes returns newest-first.
+            # Pick the point with the largest timestamp.
+            newest = max(
+                resp.power_level_data,
+                key=lambda pt: int(getattr(pt, "time", None).seconds)
+                if getattr(pt, "time", None) is not None
+                else 0,
+            )
+            latest_power_w = float(newest.power_to_home_kw) * 1000.0
+            if newest.HasField("time"):
+                latest_power_ts = int(newest.time.seconds)
 
         return {
             "latest_power_w": latest_power_w,
+            "latest_power_ts": latest_power_ts,
             "power_level_points": [
                 {
                     "ts": ts(pt),
@@ -647,11 +658,17 @@ class BasePowerClient:
                 "solar_to_home": float(resp.energy_usage_source.solar_to_home_kwh),
                 "storage_to_home": float(resp.energy_usage_source.storage_to_home_kwh),
             },
+            "latest_duration_hours": _latest_by_time(
+                resp.duration_data, "duration"
+            ),
+            "latest_duration_at_750w_hours": _latest_by_time(
+                resp.duration_data, "duration_at_750w"
+            ),
             "duration_points": [
                 {
                     "ts": ts(pt),
-                    "duration_min": float(pt.duration),
-                    "duration_at_750w_min": float(pt.duration_at_750w),
+                    "duration_hours": float(pt.duration),
+                    "duration_at_750w_hours": float(pt.duration_at_750w),
                 }
                 for pt in resp.duration_data
             ],
@@ -663,6 +680,27 @@ class BasePowerClient:
                 for pt in resp.grid_event_data
             ],
         }
+
+
+def _latest_by_time(points: Any, field: str) -> float | None:
+    """Return ``field`` from the point in ``points`` with the largest timestamp.
+
+    Handles proto repeated messages that may be returned newest-first or
+    oldest-first - we don't assume ordering.
+    """
+
+    if not points:
+        return None
+
+    def ts_of(pt: Any) -> int:
+        t = getattr(pt, "time", None)
+        if t is None:
+            return 0
+        return int(getattr(t, "seconds", 0) or 0)
+
+    newest = max(points, key=ts_of)
+    val = getattr(newest, field, None)
+    return float(val) if val is not None else None
 
 
 def _format_address(addr: Any) -> str:
