@@ -1,0 +1,14 @@
+{
+  "domain": "base_power",
+  "name": "Base Power",
+  "version": "0.1.0",
+  "documentation": "https://github.com/moelsaied88/base-power-hass",
+  "issue_tracker": "https://github.com/moelsaied88/base-power-hass/issues",
+  "codeowners": ["@moelsaied88"],
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "integration_type": "hub",
+  "requirements": ["aiohttp>=3.9", "protobuf>=4.25"],
+  "dependencies": [],
+  "after_dependencies": []
+}

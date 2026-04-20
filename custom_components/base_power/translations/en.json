@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Base Power",
+        "description": "Sign in with the email and password you use at account.basepowercompany.com.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Could not reach Base Power. Check your internet connection.",
+      "no_locations": "No service locations found on your account.",
+      "unknown": "An unexpected error occurred. See the Home Assistant log for details."
+    },
+    "abort": {
+      "already_configured": "This Base Power account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Base Power polling intervals",
+        "data": {
+          "poll_interval_grid": "Poll interval while on grid (seconds)",
+          "poll_interval_outage": "Poll interval during a grid outage (seconds)"
+        }
+      }
+    }
+  }
+}
