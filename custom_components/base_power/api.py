@@ -658,17 +658,18 @@ class BasePowerClient:
                 "solar_to_home": float(resp.energy_usage_source.solar_to_home_kwh),
                 "storage_to_home": float(resp.energy_usage_source.storage_to_home_kwh),
             },
-            "latest_duration_hours": _latest_by_time(
+            # Base returns these in MINUTES.
+            "latest_duration_min": _latest_by_time(
                 resp.duration_data, "duration"
             ),
-            "latest_duration_at_750w_hours": _latest_by_time(
+            "latest_duration_at_750w_min": _latest_by_time(
                 resp.duration_data, "duration_at_750w"
             ),
             "duration_points": [
                 {
                     "ts": ts(pt),
-                    "duration_hours": float(pt.duration),
-                    "duration_at_750w_hours": float(pt.duration_at_750w),
+                    "duration_min": float(pt.duration),
+                    "duration_at_750w_min": float(pt.duration_at_750w),
                 }
                 for pt in resp.duration_data
             ],

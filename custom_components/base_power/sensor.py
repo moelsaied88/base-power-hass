@@ -110,26 +110,30 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
     ),
+    # Base returns `duration` as a float in MINUTES (confirmed against the
+    # app: 177 minutes ~= 3 hours "at current usage"). The prior version
+    # misread this because Base returns duration_data newest-first and we
+    # were picking position [-1] (the oldest point, often a tiny value).
     BasePowerSensorDescription(
         key="backup_runtime",
         name="Backup Runtime (at current usage)",
         icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.HOURS,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_hours"
+            "latest_duration_min"
         ),
     ),
     BasePowerSensorDescription(
         key="backup_runtime_at_750w",
         name="Backup Runtime (at 750W low usage)",
         icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.HOURS,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_at_750w_hours"
+            "latest_duration_at_750w_min"
         ),
     ),
 )
