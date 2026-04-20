@@ -40,20 +40,18 @@ from .const import (
     CONF_EMAIL,
     CONF_POLL_INTERVAL_GRID,
     CONF_POLL_INTERVAL_OUTAGE,
+    CONF_POLL_INTERVAL_USAGE,
     CONF_SERVICE_LOCATION_ID,
     CONF_SESSION_ID,
     DEFAULT_POLL_INTERVAL_GRID,
     DEFAULT_POLL_INTERVAL_OUTAGE,
+    DEFAULT_POLL_INTERVAL_USAGE,
     DOMAIN,
     EVENT_OUTAGE_ENDED,
     EVENT_OUTAGE_STARTED,
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# Usage/energy data rarely changes faster than once per minute, so we cap the
-# MobileGetRecentUsage call rate regardless of primary polling interval.
-USAGE_MIN_INTERVAL_SECONDS = 60.0
 
 
 class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -77,12 +75,23 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 DEFAULT_POLL_INTERVAL_OUTAGE.total_seconds(),
             )
         )
+        # Usage (power/energy) data fetch cadence. Controls how often we call
+        # MobileGetRecentUsage, which is what the Home Power sensor reads from.
+        self._usage_interval = timedelta(
+            seconds=entry.options.get(
+                CONF_POLL_INTERVAL_USAGE,
+                DEFAULT_POLL_INTERVAL_USAGE.total_seconds(),
+            )
+        )
+        # The HA DataUpdateCoordinator ticks at the smallest of the three
+        # intervals so every source can be refreshed at its configured rate.
+        initial_interval = min(self._grid_interval, self._usage_interval)
 
         super().__init__(
             hass,
             _LOGGER,
             name=f"Base Power ({entry.data.get(CONF_EMAIL, 'unknown')})",
-            update_interval=self._grid_interval,
+            update_interval=initial_interval,
         )
 
         session = aiohttp_client.async_get_clientsession(hass)
@@ -134,7 +143,10 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         usage = self._last_usage
         now = time.monotonic()
-        if now - self._last_usage_fetch >= USAGE_MIN_INTERVAL_SECONDS:
+        usage_interval_s = self._usage_interval.total_seconds()
+        # Small tolerance prevents drift-induced skip when the main tick and
+        # the usage interval are the same value.
+        if now - self._last_usage_fetch >= usage_interval_s - 0.5:
             try:
                 usage = await self.client.get_recent_usage(location.address_id)
                 self._last_usage = usage
@@ -172,7 +184,13 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     def _apply_adaptive_interval(self, active_outage: bool) -> None:
-        wanted = self._outage_interval if active_outage else self._grid_interval
+        # The tick interval must be the minimum of the "status" pace (grid or
+        # outage) and the usage pace, so each endpoint gets polled at (or
+        # faster than) its configured rate.
+        status_interval = (
+            self._outage_interval if active_outage else self._grid_interval
+        )
+        wanted = min(status_interval, self._usage_interval)
         if self.update_interval != wanted:
             self.update_interval = wanted
             _LOGGER.debug(

@@ -43,10 +43,12 @@ from .const import (
     CONF_CODE,
     CONF_POLL_INTERVAL_GRID,
     CONF_POLL_INTERVAL_OUTAGE,
+    CONF_POLL_INTERVAL_USAGE,
     CONF_SERVICE_LOCATION_ID,
     CONF_SESSION_ID,
     DEFAULT_POLL_INTERVAL_GRID,
     DEFAULT_POLL_INTERVAL_OUTAGE,
+    DEFAULT_POLL_INTERVAL_USAGE,
     DOMAIN,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
@@ -260,6 +262,19 @@ class BasePowerOptionsFlow(OptionsFlow):
                     default=current.get(
                         CONF_POLL_INTERVAL_OUTAGE,
                         DEFAULT_POLL_INTERVAL_OUTAGE.total_seconds(),
+                    ),
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(
+                        min=MIN_POLL_INTERVAL.total_seconds(),
+                        max=MAX_POLL_INTERVAL.total_seconds(),
+                    ),
+                ),
+                vol.Optional(
+                    CONF_POLL_INTERVAL_USAGE,
+                    default=current.get(
+                        CONF_POLL_INTERVAL_USAGE,
+                        DEFAULT_POLL_INTERVAL_USAGE.total_seconds(),
                     ),
                 ): vol.All(
                     vol.Coerce(int),
