@@ -119,12 +119,24 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
     ),
     BasePowerSensorDescription(
         key="usable_battery_energy",
-        name="Usable Battery Energy",
+        name="Usable Battery Energy (remaining)",
         icon="mdi:battery-charging",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY_STORAGE,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _usable_battery_energy_kwh(data),
+    ),
+    # Derived total capacity. availableBackupAt750W scales linearly with SoE,
+    # so dividing remaining kWh by SoE fraction gives the full-charge number.
+    # For a dual-battery install this is ~33 kWh (two ~16-17 kWh units).
+    BasePowerSensorDescription(
+        key="battery_capacity",
+        name="Battery Capacity (at 100%)",
+        icon="mdi:battery",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _full_battery_capacity_kwh(data),
     ),
     # Energy totals come from MobileGetRecentUsage, which is 15-min bucketed
     # and polled on the secondary (poll_interval_usage) cadence.
@@ -169,12 +181,34 @@ def _usable_battery_energy_kwh(data: dict[str, Any]) -> float | None:
 
     Base exposes runtime at a constant 750 W load as
     ``availableBackupAt750W`` (hours). Usable kWh = 0.75 * hours. This value
-    comes from ServiceContext and updates live.
+    comes from ServiceContext and updates live. Note: this is what's left
+    at the current state of energy, not the battery's total capacity.
     """
     hours = _ctx(data).get("backup_runtime_at_750w_hours")
     if hours is None:
         return None
     return float(hours) * 0.75
+
+
+def _full_battery_capacity_kwh(data: dict[str, Any]) -> float | None:
+    """Return the full-charge usable capacity in kWh.
+
+    Derived from remaining usable kWh / (state of energy / 100). A small SoE
+    floor avoids dividing by near-zero when the bank is nearly empty.
+    """
+    remaining = _usable_battery_energy_kwh(data)
+    if remaining is None:
+        return None
+    soe = _ctx(data).get("state_of_energy_pct")
+    if soe is None:
+        return None
+    try:
+        soe_fraction = float(soe) / 100.0
+    except (TypeError, ValueError):
+        return None
+    if soe_fraction < 0.05:
+        return None
+    return remaining / soe_fraction
 
 
 async def async_setup_entry(
@@ -253,6 +287,13 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
                 "source_duration_at_750w_hours": ctx.get(
                     "backup_runtime_at_750w_hours"
                 ),
+                "state_of_energy_pct": ctx.get("state_of_energy_pct"),
+            }
+        if key == "battery_capacity":
+            return {
+                "formula": "remaining_kwh / (state_of_energy_pct / 100)",
+                "remaining_kwh": _usable_battery_energy_kwh(data),
+                "state_of_energy_pct": ctx.get("state_of_energy_pct"),
             }
         if key == "battery_state_of_energy":
             return {
