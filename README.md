@@ -22,6 +22,27 @@ Adaptive polling: 60s normal, 10s while on battery.
 5. Settings → Devices & Services → Add Integration → search "Base Power"
 6. Enter your Base Power account email + password
 
+## Energy Dashboard setup
+
+Base reports instantaneous power in watts. To feed the HA Energy Dashboard
+you need monotonically-increasing kWh counters, which HA builds for you via
+`Integration` (Riemann-sum) helpers over these live power sensors:
+
+| Energy Dashboard slot | Source sensor | Method | Time unit |
+|---|---|---|---|
+| Grid consumption | `sensor.base_power_power_from_grid` | Left | h |
+| Solar production | `sensor.base_power_power_from_solar` | Left | h |
+| Energy going IN to the battery | `sensor.base_power_power_to_battery` | Left | h |
+| Energy coming OUT of the battery | `sensor.base_power_power_from_battery` | Left | h |
+
+Create one `Integration` helper per row (Settings → Devices & Services →
+Helpers → + Create Helper → Integration). The resulting kWh counters can
+then be selected in Settings → Energy.
+
+> Do **not** use the `(window)` energy sensors for the dashboard - they are
+> rolling-window totals that can decrease as the window slides, which would
+> corrupt long-term statistics.
+
 ## How it works
 
 See [`custom_components/base_power/README.md`](custom_components/base_power/README.md) for architecture details, entity list, diagnostics/privacy notes, and limitations.

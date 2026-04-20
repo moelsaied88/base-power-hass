@@ -78,14 +78,37 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _ctx(data).get("power_from_grid_w"),
     ),
+    # Signed battery power. Negative = charging (grid/solar pushing INTO the
+    # bank), positive = discharging (bank powering the home). Retained for
+    # backward compatibility. New installs should prefer the split
+    # power_to_battery / power_from_battery_discharge entities below, which are
+    # positive-only and feed directly into Energy Dashboard integrators.
     BasePowerSensorDescription(
         key="power_from_storage",
+        name="Battery Net Power",
+        icon="mdi:battery-charging-outline",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("power_from_storage_w"),
+    ),
+    BasePowerSensorDescription(
+        key="power_to_battery",
+        name="Power To Battery",
+        icon="mdi:battery-arrow-up",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _charge_power_w(data),
+    ),
+    BasePowerSensorDescription(
+        key="power_from_battery_discharge",
         name="Power From Battery",
         icon="mdi:battery-arrow-down",
         native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: _ctx(data).get("power_from_storage_w"),
+        value_fn=lambda data: _discharge_power_w(data),
     ),
     BasePowerSensorDescription(
         key="power_from_solar",
@@ -180,6 +203,34 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         ).get("storage_to_home"),
     ),
 )
+
+
+def _charge_power_w(data: dict[str, Any]) -> float | None:
+    """Positive W when the battery bank is charging, else 0.
+
+    Base's ``powerFromStorage`` is signed: negative when grid/solar is pushing
+    energy INTO the bank. Clamping ``-signed`` to >= 0 gives a clean charge
+    rate that can be fed straight into an ``Integration`` helper for the
+    Energy Dashboard's "energy going in to the battery" slot.
+    """
+    raw = _ctx(data).get("power_from_storage_w")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, -float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _discharge_power_w(data: dict[str, Any]) -> float | None:
+    """Positive W when the battery bank is discharging, else 0."""
+    raw = _ctx(data).get("power_from_storage_w")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def _usable_battery_energy_kwh(data: dict[str, Any]) -> float | None:
@@ -279,6 +330,8 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
                 "from_grid_w": ctx.get("power_from_grid_w"),
                 "from_storage_w": ctx.get("power_from_storage_w"),
                 "from_solar_w": ctx.get("power_from_solar_w"),
+                "to_battery_w": _charge_power_w(data),
+                "discharge_w": _discharge_power_w(data),
             }
         if key == "backup_runtime":
             return {
