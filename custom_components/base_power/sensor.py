@@ -110,10 +110,12 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
     ),
-    # Base returns `duration` as a float in HOURS. Confirmed by matching a
-    # 2.95h reading against the app's "~3 hours at actual usage". The prior
-    # positional [-1] read in v0.2.0 and the unfiltered max() in v0.3.0 both
-    # grabbed junk zero-timestamp points; v0.3.2 filters those out.
+    # Live-computed to match the Base app's "X hrs at current usage" number.
+    # We derive usable battery energy from Base's constant
+    # duration_at_750w_hours (kWh = 0.75 * hours) and divide by our actual
+    # Home Power reading. Base's mobile app uses the exact same formula:
+    #   - 10 kWh usable / 6.5 kW live = 1.54 h  ("~1.5 hrs at high usage")
+    #   - 10 kWh usable / 0.75 kW     = 13.3 h  ("~13.3 hrs with low usage")
     BasePowerSensorDescription(
         key="backup_runtime",
         name="Backup Runtime (at current usage)",
@@ -121,22 +123,52 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.HOURS,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_hours"
-        ),
+        value_fn=lambda data: _derive_backup_runtime_hours(data),
     ),
     BasePowerSensorDescription(
-        key="backup_runtime_at_750w",
-        name="Backup Runtime (at 750W low usage)",
-        icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.HOURS,
-        device_class=SensorDeviceClass.DURATION,
+        key="usable_battery_energy",
+        name="Usable Battery Energy",
+        icon="mdi:battery-charging",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (data.get("usage") or {}).get(
-            "latest_duration_at_750w_hours"
-        ),
+        value_fn=lambda data: _usable_battery_energy_kwh(data),
     ),
 )
+
+
+def _usable_battery_energy_kwh(data: dict[str, Any]) -> float | None:
+    """Return the currently-usable battery energy in kWh.
+
+    Derived from Base's ``duration_at_750w`` field, which represents hours
+    of backup at a constant 750W load - i.e. usable_energy_kwh = hours * 0.75.
+    """
+    usage = data.get("usage") or {}
+    hours = usage.get("latest_duration_at_750w_hours")
+    if hours is None:
+        return None
+    return float(hours) * 0.75
+
+
+def _derive_backup_runtime_hours(data: dict[str, Any]) -> float | None:
+    """Compute remaining backup runtime at current Home Power load.
+
+    Uses the same formula as the Base mobile app:
+        runtime_hours = usable_battery_energy_kwh / current_home_power_kw
+
+    Returns None when we have no usable energy or no recent power sample.
+    Clamps home power to at least 100 W so that ultra-low draws don't blow
+    up to absurd runtime estimates (the app does the same kind of guard).
+    """
+    usable = _usable_battery_energy_kwh(data)
+    if usable is None or usable <= 0:
+        return None
+    usage = data.get("usage") or {}
+    power_w = usage.get("latest_power_w")
+    if power_w is None:
+        return None
+    power_kw = max(float(power_w), 100.0) / 1000.0
+    return usable / power_kw
 
 
 async def async_setup_entry(
@@ -202,9 +234,19 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
         key = self.entity_description.key
         if key == "home_power":
             return {"latest_sample_ts": usage.get("latest_power_ts")}
-        if key in ("backup_runtime", "backup_runtime_at_750w"):
-            points = usage.get("duration_points") or []
-            if not points:
-                return None
-            return {"recent_points": points[-24:]}
+        if key == "backup_runtime":
+            return {
+                "formula": "usable_energy_kwh / home_power_kw",
+                "usable_battery_energy_kwh": _usable_battery_energy_kwh(data),
+                "home_power_w": usage.get("latest_power_w"),
+                "base_reported_duration_hours": usage.get(
+                    "latest_duration_hours"
+                ),
+            }
+        if key == "usable_battery_energy":
+            return {
+                "source_duration_at_750w_hours": usage.get(
+                    "latest_duration_at_750w_hours"
+                ),
+            }
         return None
