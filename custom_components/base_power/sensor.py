@@ -119,6 +119,42 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _ctx(data).get("power_from_solar_w"),
     ),
+    # Home-allocation sensors. Base's raw ``power_from_grid`` and
+    # ``power_from_storage`` are meter-level readings that include arbitrage
+    # flows that never touch the home (Base charging the bank from the grid
+    # when rates are cheap, or discharging the bank to export during peak).
+    # These three derive "what portion of home load each source is actually
+    # supplying" using self-consumption priority (solar -> battery -> grid)
+    # and are guaranteed always >= 0 and to sum to ``home_power_w``. Feed
+    # these into Integration helpers for the Energy Dashboard and arbitrage
+    # is excluded by construction.
+    BasePowerSensorDescription(
+        key="home_from_grid",
+        name="Home From Grid",
+        icon="mdi:transmission-tower",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _home_alloc(data)["grid"],
+    ),
+    BasePowerSensorDescription(
+        key="home_from_battery",
+        name="Home From Battery",
+        icon="mdi:home-battery",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _home_alloc(data)["battery"],
+    ),
+    BasePowerSensorDescription(
+        key="home_from_solar",
+        name="Home From Solar",
+        icon="mdi:solar-power-variant",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _home_alloc(data)["solar"],
+    ),
     # Base reports live backup runtime directly (what the app displays as
     # "X hrs at current usage"). No more local derivation.
     BasePowerSensorDescription(
@@ -231,6 +267,57 @@ def _discharge_power_w(data: dict[str, Any]) -> float | None:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return None
+
+
+def _home_alloc(data: dict[str, Any]) -> dict[str, float | None]:
+    """Allocate live ``home_power_w`` across solar/battery/grid.
+
+    Base's ``powerFlow`` fields are meter-level, so integrating them for the
+    Energy Dashboard accidentally counts arbitrage (grid->battery charging or
+    battery->grid export). This helper returns the portion of the current
+    home load that each source is supplying, using the standard self-
+    consumption priority (solar first, then battery discharge, then grid).
+    All three values are always non-negative and sum to ``home_power_w``.
+
+    When the battery is charging (``powerFromStorage`` < 0) or the grid is
+    exporting (``powerFromGrid`` < 0) that source contributes 0 to the home
+    budget - so arbitrage flows don't leak into the dashboard.
+    """
+
+    ctx = _ctx(data)
+    none_tuple = {"grid": None, "battery": None, "solar": None}
+
+    h_raw = ctx.get("home_power_w")
+    if h_raw is None:
+        return none_tuple
+    try:
+        h = max(0.0, float(h_raw))
+    except (TypeError, ValueError):
+        return none_tuple
+
+    def _pos(v: Any) -> float:
+        if v is None:
+            return 0.0
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            return 0.0
+
+    solar_avail = _pos(ctx.get("power_from_solar_w"))
+    battery_avail = _pos(ctx.get("power_from_storage_w"))
+    grid_avail = _pos(ctx.get("power_from_grid_w"))
+
+    from_solar = min(solar_avail, h)
+    remaining = h - from_solar
+    from_battery = min(battery_avail, remaining)
+    remaining -= from_battery
+    from_grid = min(grid_avail, remaining)
+
+    return {
+        "grid": round(from_grid, 1),
+        "battery": round(from_battery, 1),
+        "solar": round(from_solar, 1),
+    }
 
 
 def _usable_battery_energy_kwh(data: dict[str, Any]) -> float | None:
