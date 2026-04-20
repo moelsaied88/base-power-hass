@@ -723,6 +723,38 @@ class BasePowerClient:
             "wifi_state": str(gateway_wifi.get("state") or ""),
         }
 
+    async def get_grid_status(
+        self, service_location_id: int
+    ) -> dict[str, Any]:
+        """Fetch recent grid-voltage time series.
+
+        ServiceContext's ``gridVoltage`` is optional and Base often omits it,
+        so the app also polls ``MobileGetGridStatus`` at 1 Hz. This returns
+        parallel ``voltage`` and ``timestampsTz`` arrays; we just surface the
+        newest value.
+        """
+
+        resp = await self._mobile_json(
+            "MobileGetGridStatus",
+            body={"serviceLocationID": service_location_id},
+        )
+        voltages = resp.get("voltage") or []
+        timestamps = resp.get("timestampsTz") or []
+        latest_voltage: float | None = None
+        latest_ts: str | None = None
+        if voltages:
+            try:
+                latest_voltage = float(voltages[-1])
+            except (TypeError, ValueError):
+                latest_voltage = None
+            if timestamps:
+                latest_ts = str(timestamps[-1])
+        return {
+            "grid_voltage": latest_voltage,
+            "latest_grid_voltage_ts": latest_ts,
+            "voltage_samples": list(voltages),
+        }
+
     async def get_recent_usage(self, address_id: str) -> dict[str, Any]:
         """Return recent time-series usage (power, energy, outage events)."""
 

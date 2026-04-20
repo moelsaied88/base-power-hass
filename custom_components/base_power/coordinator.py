@@ -147,6 +147,23 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except BasePowerError as exc:  # noqa: BLE001
             raise UpdateFailed(str(exc)) from exc
 
+        # Base often omits gridVoltage from ServiceContext. Fall back to the
+        # dedicated mobile endpoint that returns a voltage time series and
+        # use the newest sample. Best-effort: never mask the primary payload.
+        grid: dict[str, Any] | None = None
+        try:
+            grid = await self.client.get_grid_status(
+                location.service_location_id
+            )
+        except BasePowerError as exc:
+            _LOGGER.debug("grid_status fetch failed: %s", exc)
+
+        if grid and grid.get("grid_voltage") is not None and (
+            context.get("grid_voltage") is None
+        ):
+            context["grid_voltage"] = grid["grid_voltage"]
+            context["grid_voltage_ts"] = grid.get("latest_grid_voltage_ts")
+
         usage = self._last_usage
         now = time.monotonic()
         usage_interval_s = self._usage_interval.total_seconds()
