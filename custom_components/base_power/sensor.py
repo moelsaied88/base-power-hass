@@ -138,37 +138,43 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _full_battery_capacity_kwh(data),
     ),
-    # Energy totals come from MobileGetRecentUsage, which is 15-min bucketed
-    # and polled on the secondary (poll_interval_usage) cadence.
+    # Energy totals from MobileGetRecentUsage. These are a *rolling window*
+    # the Base app uses for its "recent" view - the value can go DOWN as the
+    # window slides, so they are MEASUREMENT (not TOTAL_INCREASING). Do NOT
+    # plug them into the Energy Dashboard; for that, integrate the live
+    # power_from_* sensors via an Integration helper instead.
     BasePowerSensorDescription(
         key="energy_grid_to_home",
-        name="Energy From Grid (recent)",
+        name="Energy From Grid (window)",
         icon="mdi:transmission-tower-export",
+        entity_registry_enabled_default=False,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("grid_to_home"),
     ),
     BasePowerSensorDescription(
         key="energy_solar_to_home",
-        name="Energy From Solar (recent)",
+        name="Energy From Solar (window)",
         icon="mdi:solar-power",
+        entity_registry_enabled_default=False,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("solar_to_home"),
     ),
     BasePowerSensorDescription(
         key="energy_storage_to_home",
-        name="Energy From Battery (recent)",
+        name="Energy From Battery (window)",
         icon="mdi:battery-arrow-down",
+        entity_registry_enabled_default=False,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
