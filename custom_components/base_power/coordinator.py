@@ -1,10 +1,16 @@
 """DataUpdateCoordinator for Base Power.
 
-Polls `GetServiceStatus` (cheap, fast) every ``poll_interval_grid`` seconds,
-dropping to ``poll_interval_outage`` seconds whenever ``activeOutage`` is True.
+Primary poll: ``MobileGetServiceContext`` on the mobile API host
+(``dashboard.baseapis.net``). This is the same endpoint the Base Android app
+hits at 1 Hz to drive its live dashboard. It returns powerFlow (kW),
+stateOfEnergyRaw (%), availableBackup (hours at current draw), gridVoltage,
+and outage flags. We run it every ``poll_interval_grid`` seconds by default
+(5 s), dropping to ``poll_interval_outage`` seconds when the home is on
+battery.
 
-Pulls `MobileGetRecentUsage` (heavier, time-series) less frequently on a
-secondary cadence to feed power/energy sensors without hammering the API.
+Secondary poll: ``MobileGetRecentUsage`` on the Connect-RPC host runs at a
+slower cadence to power the recent-energy-by-source sensors. ServiceContext
+doesn't expose those totals.
 
 On ``activeOutage`` transitions we fire ``base_power_outage_started`` /
 ``base_power_outage_ended`` on the HA event bus so automations can react.
@@ -128,7 +134,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             location = await self._ensure_auth_and_location()
-            status = await self.client.get_service_status(
+            context = await self.client.get_service_context(
                 location.service_location_id
             )
         except BasePowerAuthError as exc:
@@ -144,8 +150,9 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usage = self._last_usage
         now = time.monotonic()
         usage_interval_s = self._usage_interval.total_seconds()
-        # Small tolerance prevents drift-induced skip when the main tick and
-        # the usage interval are the same value.
+        # ServiceContext doesn't have energy-by-source totals, so we keep a
+        # slower secondary poll of MobileGetRecentUsage for the Energy
+        # dashboard sensors. Defaults to 5 min (see const.py).
         if now - self._last_usage_fetch >= usage_interval_s - 0.5:
             try:
                 usage = await self.client.get_recent_usage(location.address_id)
@@ -154,11 +161,26 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except BasePowerError as exc:
                 _LOGGER.debug("recent_usage fetch failed: %s", exc)
 
-        self._maybe_fire_outage_event(status["active_outage"])
-        self._apply_adaptive_interval(status["active_outage"])
+        self._maybe_fire_outage_event(context["active_outage"])
+        self._apply_adaptive_interval(context["active_outage"])
 
         return {
-            "status": status,
+            "context": context,
+            # Kept under "status" too for any external automations/templates
+            # that were reading from it before. Field names unchanged.
+            "status": {
+                "grid_voltage": context.get("grid_voltage"),
+                "has_gateway": context.get("has_gateway"),
+                "gateway_connected": context.get("gateway_connected"),
+                "state_of_energy": context.get("state_of_energy_bucket"),
+                "active_overcurrent": context.get("active_overcurrent"),
+                "active_overcurrent_standby": context.get(
+                    "active_overcurrent_standby"
+                ),
+                "active_outage": context.get("active_outage"),
+                "wifi_ssid": context.get("wifi_ssid"),
+                "wifi_state": context.get("wifi_state"),
+            },
             "usage": usage,
             "location": {
                 "service_location_id": location.service_location_id,

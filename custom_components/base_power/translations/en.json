@@ -39,11 +39,11 @@
     "step": {
       "init": {
         "title": "Base Power polling intervals",
-        "description": "Status poll calls MobileGetServiceStatus (voltage, outage flag, battery state). Usage poll calls MobileGetRecentUsage (home power, energy, backup runtime). Faster polling gives fresher Home Power readings but increases load on Base's servers; 5s is a reasonable minimum.",
+        "description": "Status poll calls MobileGetServiceContext (live home power, battery %, backup runtime, grid voltage, outage flag). Usage poll calls MobileGetRecentUsage for the Energy dashboard sensors; Base only publishes those in 15-minute buckets, so polling them faster than a minute doesn't help.",
         "data": {
-          "poll_interval_grid": "Status poll interval while on grid (seconds)",
-          "poll_interval_outage": "Status poll interval during a grid outage (seconds)",
-          "poll_interval_usage": "Usage (Home Power / energy) poll interval (seconds)"
+          "poll_interval_grid": "Live status poll interval while on grid (seconds)",
+          "poll_interval_outage": "Live status poll interval during a grid outage (seconds)",
+          "poll_interval_usage": "Energy totals poll interval (seconds)"
         }
       }
     }

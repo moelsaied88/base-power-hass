@@ -27,13 +27,26 @@ class BasePowerBinaryDescription(BinarySensorEntityDescription):
     is_on_fn: Callable[[dict[str, Any]], bool | None]
 
 
+def _ctx(data: dict[str, Any]) -> dict[str, Any]:
+    return data.get("context") or {}
+
+
 BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
     BasePowerBinaryDescription(
         key="on_battery",
         name="On Battery",
         icon="mdi:battery-alert",
         device_class=BinarySensorDeviceClass.POWER,
-        is_on_fn=lambda data: data["status"].get("active_outage"),
+        is_on_fn=lambda data: _ctx(data).get("active_outage"),
+    ),
+    # Track the home's actual power status as reported by Base's gateway.
+    # Flips to False during an outage while the house still runs on battery.
+    BasePowerBinaryDescription(
+        key="home_has_power",
+        name="Home Has Power",
+        icon="mdi:home-lightning-bolt-outline",
+        device_class=BinarySensorDeviceClass.POWER,
+        is_on_fn=lambda data: _ctx(data).get("home_has_power"),
     ),
     BasePowerBinaryDescription(
         key="grid_connected",
@@ -42,8 +55,8 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         is_on_fn=lambda data: (
             None
-            if data["status"].get("active_outage") is None
-            else not data["status"]["active_outage"]
+            if _ctx(data).get("active_outage") is None
+            else not _ctx(data).get("active_outage")
         ),
     ),
     BasePowerBinaryDescription(
@@ -51,14 +64,14 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         name="Gateway Connected",
         icon="mdi:wifi",
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        is_on_fn=lambda data: data["status"].get("gateway_connected"),
+        is_on_fn=lambda data: _ctx(data).get("gateway_connected"),
     ),
     BasePowerBinaryDescription(
         key="overcurrent_active",
         name="Overcurrent Protection Active",
         icon="mdi:flash-alert",
         device_class=BinarySensorDeviceClass.PROBLEM,
-        is_on_fn=lambda data: data["status"].get("active_overcurrent"),
+        is_on_fn=lambda data: _ctx(data).get("active_overcurrent"),
     ),
     BasePowerBinaryDescription(
         key="overcurrent_standby",
@@ -66,7 +79,7 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         icon="mdi:flash-alert-outline",
         entity_registry_enabled_default=False,
         device_class=BinarySensorDeviceClass.PROBLEM,
-        is_on_fn=lambda data: data["status"].get("active_overcurrent_standby"),
+        is_on_fn=lambda data: _ctx(data).get("active_overcurrent_standby"),
     ),
 )
 

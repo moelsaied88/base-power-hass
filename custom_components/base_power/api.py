@@ -45,6 +45,12 @@ ACCOUNT_ORIGIN = "https://account.basepowercompany.com"
 CLERK_ORIGIN = "https://clerk.basepowercompany.com"
 CONNECT_BASE = f"{ACCOUNT_ORIGIN}/api/connect"
 
+# Mobile app REST/JSON API. Extracted from the Android app (v1.10.1) Hermes
+# bundle at dashboard.baseapis.net: it exposes a superset of the web Connect
+# endpoints, including the live 1 Hz `MobileGetServiceContext` which returns
+# real-time powerFlow, stateOfEnergyRaw and availableBackup hours.
+BASE_MOBILE_ORIGIN = "https://dashboard.baseapis.net"
+
 # Observed from the web SPA - passed as query params on every Clerk request.
 CLERK_API_VERSION = "2025-11-10"
 CLERK_JS_VERSION = "5.125.9"
@@ -574,31 +580,147 @@ class BasePowerClient:
             timezone=str(getattr(resp.address, "timezoneIdentifier", "") or ""),
         )
 
-    async def get_service_status(self, service_location_id: int) -> dict[str, Any]:
-        """Poll live service status (battery SoC, outage, grid voltage)."""
+    async def _mobile_json(
+        self,
+        endpoint: str,
+        *,
+        method: str = "POST",
+        body: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call a Base mobile app REST endpoint.
 
-        resp = await self._connect_rpc(
-            service="dashboard.DashboardAPI",
-            method="GetServiceStatus",
-            request_type="dashboard.GetServiceStatusRequest",
-            response_type="dashboard.GetServiceStatusResponse",
-            request_fields={"serviceLocationID": service_location_id},
+        Matches how the official Android app's ``fetchWithAuth`` wrapper
+        formats requests: ``${host}/${endpoint}`` with a raw Clerk JWT in the
+        ``authorization`` header (no ``Bearer`` prefix), JSON body.
+        """
+
+        jwt = await self._auth.get_jwt()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # The Android client sends the raw JWT, not "Bearer <jwt>".
+            # Kept exactly the same here so our traffic pattern matches.
+            "authorization": jwt,
+            "User-Agent": _user_agent(),
+        }
+        url = f"{BASE_MOBILE_ORIGIN}/{endpoint}"
+        try:
+            async with self._session.request(
+                method,
+                url,
+                json=dict(body) if body is not None else None,
+                headers=headers,
+                timeout=DEFAULT_TIMEOUT,
+            ) as resp:
+                if resp.status == 401:
+                    await self._auth.reset()
+                    raise BasePowerAuthError(f"401 from {endpoint}")
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise BasePowerProtocolError(
+                        f"{endpoint} returned {resp.status}: {text[:200]}"
+                    )
+                try:
+                    return await resp.json()
+                except aiohttp.ContentTypeError as exc:
+                    raise BasePowerProtocolError(
+                        f"{endpoint} returned non-JSON body"
+                    ) from exc
+        except aiohttp.ClientError as exc:
+            raise BasePowerConnectionError(
+                f"network error calling {endpoint}"
+            ) from exc
+
+    async def get_service_context(
+        self, service_location_id: int
+    ) -> dict[str, Any]:
+        """Poll the live service context from the mobile API.
+
+        This is the 1 Hz endpoint the Base Android app polls to drive its
+        Home Energy / Live view. Returns a normalized dict with:
+
+        * ``home_power_w``        -- live home load (powerFlow.toHome * 1000)
+        * ``power_from_grid_w``   -- powerFlow.fromGrid (watts)
+        * ``power_from_storage_w``-- powerFlow.fromStorage (watts)
+        * ``power_from_solar_w``  -- powerFlow.fromSolar (watts)
+        * ``state_of_energy_pct`` -- stateOfEnergyRaw (0-100 battery %)
+        * ``state_of_energy_bucket`` -- stateOfEnergy (coarse bucket)
+        * ``backup_runtime_hours``-- availableBackup at live draw
+        * ``backup_runtime_at_750w_hours`` -- availableBackupAt750W
+        * ``grid_voltage``        -- gridVoltage
+        * ``home_has_power``      -- homeHasPower
+        * ``active_outage``       -- isActiveOutage
+        * ``active_overcurrent``  -- activeOutage.activeOvercurrent
+        * ``overcurrent_limit``   -- activeOutage.overcurrentLimit
+        * ``has_gateway``         -- hasGateway
+        * ``gateway_connected``   -- gatewayConnection
+        * ``wifi_ssid`` / ``wifi_state`` -- gatewayWifi.{ssid,state}
+        """
+
+        resp = await self._mobile_json(
+            "MobileGetServiceContext",
+            body={"serviceLocationID": service_location_id},
         )
+
+        def _num(v: Any) -> float | None:
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        def _int(v: Any) -> int | None:
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        power_flow = resp.get("powerFlow") or {}
+        active_outage = resp.get("activeOutage") or {}
+        gateway_wifi = resp.get("gatewayWifi") or {}
+
+        to_home_kw = _num(power_flow.get("toHome"))
+        from_grid_kw = _num(power_flow.get("fromGrid"))
+        from_storage_kw = _num(power_flow.get("fromStorage"))
+        from_solar_kw = _num(power_flow.get("fromSolar"))
+
         return {
-            "grid_voltage": getattr(resp, "gridVoltage", 0),
-            "has_gateway": bool(getattr(resp, "hasGateway", False)),
-            "gateway_connected": bool(getattr(resp, "gatewayConnection", False)),
-            "state_of_energy": int(getattr(resp, "stateOfEnergy", 0)),
-            "active_overcurrent": bool(getattr(resp, "activeOvercurrent", False)),
+            "home_power_w": None if to_home_kw is None else to_home_kw * 1000.0,
+            "power_from_grid_w": (
+                None if from_grid_kw is None else from_grid_kw * 1000.0
+            ),
+            "power_from_storage_w": (
+                None if from_storage_kw is None else from_storage_kw * 1000.0
+            ),
+            "power_from_solar_w": (
+                None if from_solar_kw is None else from_solar_kw * 1000.0
+            ),
+            "state_of_energy_pct": _num(resp.get("stateOfEnergyRaw")),
+            "state_of_energy_bucket": _int(resp.get("stateOfEnergy")),
+            "backup_runtime_hours": _num(resp.get("availableBackup")),
+            "backup_runtime_at_750w_hours": _num(
+                resp.get("availableBackupAt750W")
+            ),
+            "grid_voltage": _num(resp.get("gridVoltage")),
+            "home_has_power": _coerce_bool(resp.get("homeHasPower")),
+            "active_outage": bool(resp.get("isActiveOutage")),
+            "active_overcurrent": bool(
+                active_outage.get("activeOvercurrent", False)
+            ),
             "active_overcurrent_standby": bool(
-                getattr(resp, "activeOvercurrentStandby", False)
+                active_outage.get("activeOvercurrentStandby", False)
             ),
-            "active_outage": bool(getattr(resp, "activeOutage", False)),
-            "syn_voltage": getattr(resp, "synVoltage", 0),
-            "wifi_ssid": getattr(getattr(resp, "gatewayWifi", None), "ssid", "") or "",
-            "wifi_state": int(
-                getattr(getattr(resp, "gatewayWifi", None), "state", 0) or 0
+            "overcurrent_limit": _num(active_outage.get("overcurrentLimit")),
+            "outage_available_backup_hours": _num(
+                active_outage.get("availableBackup")
             ),
+            "has_gateway": bool(resp.get("hasGateway")),
+            "gateway_connected": _coerce_bool(resp.get("gatewayConnection")),
+            "wifi_ssid": gateway_wifi.get("ssid") or "",
+            "wifi_state": str(gateway_wifi.get("state") or ""),
         }
 
     async def get_recent_usage(self, address_id: str) -> dict[str, Any]:
@@ -683,6 +805,13 @@ class BasePowerClient:
                 for pt in resp.grid_event_data
             ],
         }
+
+
+def _coerce_bool(v: Any) -> bool | None:
+    """Return a strict bool or None (so "missing" stays distinguishable)."""
+    if v is None:
+        return None
+    return bool(v)
 
 
 def _latest_by_time(points: Any, field: str) -> float | None:

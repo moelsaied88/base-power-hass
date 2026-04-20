@@ -18,9 +18,12 @@ CONF_POLL_INTERVAL_GRID: Final = "poll_interval_grid"
 CONF_POLL_INTERVAL_OUTAGE: Final = "poll_interval_outage"
 CONF_POLL_INTERVAL_USAGE: Final = "poll_interval_usage"
 
-DEFAULT_POLL_INTERVAL_GRID: Final = timedelta(seconds=30)
+DEFAULT_POLL_INTERVAL_GRID: Final = timedelta(seconds=5)
 DEFAULT_POLL_INTERVAL_OUTAGE: Final = timedelta(seconds=5)
-DEFAULT_POLL_INTERVAL_USAGE: Final = timedelta(seconds=5)
+# MobileGetRecentUsage returns 15-minute energy buckets, so polling it faster
+# than a minute doesn't help. It only feeds the "Energy From X (recent)"
+# totals; live power/SoE come from MobileGetServiceContext on the grid tick.
+DEFAULT_POLL_INTERVAL_USAGE: Final = timedelta(minutes=5)
 
 MIN_POLL_INTERVAL: Final = timedelta(seconds=5)
 MAX_POLL_INTERVAL: Final = timedelta(minutes=10)

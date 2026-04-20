@@ -35,19 +35,21 @@ class BasePowerSensorDescription(SensorEntityDescription):
     value_fn: Callable[[dict[str, Any]], float | int | None]
 
 
+def _ctx(data: dict[str, Any]) -> dict[str, Any]:
+    return data.get("context") or {}
+
+
 SENSORS: tuple[BasePowerSensorDescription, ...] = (
-    # stateOfEnergy is an integer Base exposes in their status RPC. It is NOT
-    # the public battery state-of-charge - the mobile/web app never displays a
-    # battery % - and its exact semantics (grid-services reserve index?) are
-    # undocumented. Surface it as-is but label it accordingly so users can
-    # build their own heuristics on top.
+    # stateOfEnergyRaw is the real 0-100 battery % the Base mobile app
+    # displays on its Home Energy view. It updates at the primary poll rate.
     BasePowerSensorDescription(
         key="battery_state_of_energy",
         name="Battery State of Energy",
         icon="mdi:battery",
         native_unit_of_measurement=PERCENTAGE,
+        device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: data["status"].get("state_of_energy"),
+        value_fn=lambda data: _ctx(data).get("state_of_energy_pct"),
     ),
     BasePowerSensorDescription(
         key="grid_voltage",
@@ -56,17 +58,7 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: data["status"].get("grid_voltage") or None,
-    ),
-    BasePowerSensorDescription(
-        key="syn_voltage",
-        name="Inverter Synthetic Voltage",
-        icon="mdi:sine-wave",
-        entity_registry_enabled_default=False,
-        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        device_class=SensorDeviceClass.VOLTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: data["status"].get("syn_voltage") or None,
+        value_fn=lambda data: _ctx(data).get("grid_voltage"),
     ),
     BasePowerSensorDescription(
         key="home_power",
@@ -75,8 +67,67 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (data.get("usage") or {}).get("latest_power_w"),
+        value_fn=lambda data: _ctx(data).get("home_power_w"),
     ),
+    BasePowerSensorDescription(
+        key="power_from_grid",
+        name="Power From Grid",
+        icon="mdi:transmission-tower-export",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("power_from_grid_w"),
+    ),
+    BasePowerSensorDescription(
+        key="power_from_storage",
+        name="Power From Battery",
+        icon="mdi:battery-arrow-down",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("power_from_storage_w"),
+    ),
+    BasePowerSensorDescription(
+        key="power_from_solar",
+        name="Power From Solar",
+        icon="mdi:solar-power",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("power_from_solar_w"),
+    ),
+    # Base reports live backup runtime directly (what the app displays as
+    # "X hrs at current usage"). No more local derivation.
+    BasePowerSensorDescription(
+        key="backup_runtime",
+        name="Backup Runtime (at current usage)",
+        icon="mdi:timer-sand",
+        native_unit_of_measurement=UnitOfTime.HOURS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("backup_runtime_hours"),
+    ),
+    BasePowerSensorDescription(
+        key="backup_runtime_at_750w",
+        name="Backup Runtime at 750 W",
+        icon="mdi:timer-outline",
+        entity_registry_enabled_default=False,
+        native_unit_of_measurement=UnitOfTime.HOURS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _ctx(data).get("backup_runtime_at_750w_hours"),
+    ),
+    BasePowerSensorDescription(
+        key="usable_battery_energy",
+        name="Usable Battery Energy",
+        icon="mdi:battery-charging",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: _usable_battery_energy_kwh(data),
+    ),
+    # Energy totals come from MobileGetRecentUsage, which is 15-min bucketed
+    # and polled on the secondary (poll_interval_usage) cadence.
     BasePowerSensorDescription(
         key="energy_grid_to_home",
         name="Energy From Grid (recent)",
@@ -110,65 +161,20 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
     ),
-    # Live-computed to match the Base app's "X hrs at current usage" number.
-    # We derive usable battery energy from Base's constant
-    # duration_at_750w_hours (kWh = 0.75 * hours) and divide by our actual
-    # Home Power reading. Base's mobile app uses the exact same formula:
-    #   - 10 kWh usable / 6.5 kW live = 1.54 h  ("~1.5 hrs at high usage")
-    #   - 10 kWh usable / 0.75 kW     = 13.3 h  ("~13.3 hrs with low usage")
-    BasePowerSensorDescription(
-        key="backup_runtime",
-        name="Backup Runtime (at current usage)",
-        icon="mdi:timer-sand",
-        native_unit_of_measurement=UnitOfTime.HOURS,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: _derive_backup_runtime_hours(data),
-    ),
-    BasePowerSensorDescription(
-        key="usable_battery_energy",
-        name="Usable Battery Energy",
-        icon="mdi:battery-charging",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY_STORAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: _usable_battery_energy_kwh(data),
-    ),
 )
 
 
 def _usable_battery_energy_kwh(data: dict[str, Any]) -> float | None:
-    """Return the currently-usable battery energy in kWh.
+    """Return currently-usable battery energy in kWh.
 
-    Derived from Base's ``duration_at_750w`` field, which represents hours
-    of backup at a constant 750W load - i.e. usable_energy_kwh = hours * 0.75.
+    Base exposes runtime at a constant 750 W load as
+    ``availableBackupAt750W`` (hours). Usable kWh = 0.75 * hours. This value
+    comes from ServiceContext and updates live.
     """
-    usage = data.get("usage") or {}
-    hours = usage.get("latest_duration_at_750w_hours")
+    hours = _ctx(data).get("backup_runtime_at_750w_hours")
     if hours is None:
         return None
     return float(hours) * 0.75
-
-
-def _derive_backup_runtime_hours(data: dict[str, Any]) -> float | None:
-    """Compute remaining backup runtime at current Home Power load.
-
-    Uses the same formula as the Base mobile app:
-        runtime_hours = usable_battery_energy_kwh / current_home_power_kw
-
-    Returns None when we have no usable energy or no recent power sample.
-    Clamps home power to at least 100 W so that ultra-low draws don't blow
-    up to absurd runtime estimates (the app does the same kind of guard).
-    """
-    usable = _usable_battery_energy_kwh(data)
-    if usable is None or usable <= 0:
-        return None
-    usage = data.get("usage") or {}
-    power_w = usage.get("latest_power_w")
-    if power_w is None:
-        return None
-    power_kw = max(float(power_w), 100.0) / 1000.0
-    return usable / power_kw
 
 
 async def async_setup_entry(
@@ -222,31 +228,34 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Expose timeseries + freshness attributes for select sensors.
-
-        Lets users see Base's raw duration/power points directly in HA dev
-        tools so they can verify readings against the Base app.
-        """
+        """Expose context side-channel data for select sensors."""
         data = self.coordinator.data
         if not data:
             return None
-        usage = data.get("usage") or {}
+        ctx = data.get("context") or {}
         key = self.entity_description.key
         if key == "home_power":
-            return {"latest_sample_ts": usage.get("latest_power_ts")}
+            return {
+                "from_grid_w": ctx.get("power_from_grid_w"),
+                "from_storage_w": ctx.get("power_from_storage_w"),
+                "from_solar_w": ctx.get("power_from_solar_w"),
+            }
         if key == "backup_runtime":
             return {
-                "formula": "usable_energy_kwh / home_power_kw",
-                "usable_battery_energy_kwh": _usable_battery_energy_kwh(data),
-                "home_power_w": usage.get("latest_power_w"),
-                "base_reported_duration_hours": usage.get(
-                    "latest_duration_hours"
+                "source": "MobileGetServiceContext.availableBackup",
+                "backup_runtime_at_750w_hours": ctx.get(
+                    "backup_runtime_at_750w_hours"
                 ),
+                "state_of_energy_pct": ctx.get("state_of_energy_pct"),
             }
         if key == "usable_battery_energy":
             return {
-                "source_duration_at_750w_hours": usage.get(
-                    "latest_duration_at_750w_hours"
+                "source_duration_at_750w_hours": ctx.get(
+                    "backup_runtime_at_750w_hours"
                 ),
+            }
+        if key == "battery_state_of_energy":
+            return {
+                "bucket": ctx.get("state_of_energy_bucket"),
             }
         return None
