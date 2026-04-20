@@ -16,16 +16,18 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_ADDRESS_ID,
+    CONF_CLIENT_ID,
     CONF_EMAIL,
-    CONF_PASSWORD,
     CONF_SERVICE_LOCATION_ID,
+    CONF_SESSION_ID,
     DOMAIN,
 )
 from .coordinator import BasePowerCoordinator
 
 TO_REDACT = {
     CONF_EMAIL,
-    CONF_PASSWORD,
+    CONF_SESSION_ID,
+    CONF_CLIENT_ID,
     CONF_ADDRESS_ID,
     CONF_SERVICE_LOCATION_ID,
     "address_id",

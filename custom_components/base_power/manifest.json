@@ -1,7 +1,7 @@
 {
   "domain": "base_power",
   "name": "Base Power",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "documentation": "https://github.com/moelsaied88/base-power-hass",
   "issue_tracker": "https://github.com/moelsaied88/base-power-hass/issues",
   "codeowners": ["@moelsaied88"],

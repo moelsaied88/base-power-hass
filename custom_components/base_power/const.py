@@ -8,7 +8,9 @@ from typing import Final
 DOMAIN: Final = "base_power"
 
 CONF_EMAIL: Final = "email"
-CONF_PASSWORD: Final = "password"
+CONF_CODE: Final = "code"
+CONF_SESSION_ID: Final = "session_id"
+CONF_CLIENT_ID: Final = "client_id"
 CONF_SERVICE_LOCATION_ID: Final = "service_location_id"
 CONF_ADDRESS_ID: Final = "address_id"
 

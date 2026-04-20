@@ -2,21 +2,23 @@
 
 Two-layer design:
 
-* `_ClerkAuth` handles authentication against Clerk. The Base SPA uses Clerk
-  (https://clerk.com) for identity; we sign in with the customer's email +
-  password, obtain a Clerk *session id*, and mint fresh short-lived JWTs via
-  Clerk's `/v1/client/sessions/{sid}/tokens` endpoint.
+* `_ClerkAuth` handles authentication against Clerk. Base Power uses Clerk
+  (https://clerk.com) for identity with a **passwordless email_code** flow:
+  the user enters their email, Clerk emails a 6-digit code, we exchange the
+  code for a long-lived Clerk ``session_id``. Subsequent API calls mint
+  short-lived JWTs via ``/v1/client/sessions/{sid}/tokens``.
 * `BasePowerClient` wraps Clerk auth and provides typed access to the
   ConnectRPC endpoints exposed by `account.basepowercompany.com/api/connect/*`.
 
+Clerk's token endpoint requires the ``__client`` cookie set during sign-in.
+We capture it from the sign-in response and persist it in the config entry
+alongside ``session_id`` so JWT minting survives HA restarts.
+
 Requests are encoded as binary protobuf (Content-Type: application/proto,
 connect-protocol-version: 1). Message classes are built at runtime from the
-FileDescriptorSet that ships inside this component (`file_descriptors.bin`),
-which was extracted from the Base SPA's JS bundle — see
-`tools/base_power_capture/extract_schema.py`.
+FileDescriptorSet shipped inside this component (``file_descriptors.bin``).
 
-Nothing in this module logs credentials, JWTs, or full response bodies. Error
-messages are safe to include in HA logs.
+Nothing in this module logs credentials, codes, JWTs, or full response bodies.
 """
 
 from __future__ import annotations
@@ -200,22 +202,54 @@ def _user_agent() -> str:
 
 
 class _ClerkAuth:
-    """Handles Clerk session lifecycle and JWT minting."""
+    """Clerk email_code sign-in + JWT minting.
+
+    Two usage modes:
+
+    * **Config flow**: instantiate with just an email, call :meth:`start_sign_in`
+      to trigger the email, then :meth:`attempt_sign_in` with the 6-digit code.
+      After that, :attr:`session_id` + :attr:`client_id` can be persisted.
+    * **Coordinator / runtime**: instantiate with ``session_id`` + ``client_id``
+      recovered from the config entry; :meth:`get_jwt` mints short-lived JWTs.
+    """
 
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        email: str,
-        password: str,
+        *,
+        email: str | None = None,
+        session_id: str | None = None,
+        client_id: str | None = None,
     ) -> None:
         self._session = session
         self._email = email
-        self._password = password
-        self._client_id: str | None = None
-        self._session_id: str | None = None
+        self._session_id = session_id
+        self._client_id = client_id
+        self._sign_in_id: str | None = None
+        self._supported_factors: list[Mapping[str, Any]] = []
         self._jwt: str | None = None
         self._jwt_expiry: float = 0.0
         self._lock = asyncio.Lock()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def client_id(self) -> str | None:
+        return self._client_id
+
+    def _clerk_cookies(self) -> dict[str, str] | None:
+        """Return cookies to send on Clerk requests.
+
+        The ``__client`` cookie is captured during sign-in. Passing it back
+        on every Clerk request keeps the client bound to our session across
+        HA restarts.
+        """
+
+        if self._client_id:
+            return {"__client": self._client_id}
+        return None
 
     async def _clerk_post(
         self,
@@ -237,20 +271,22 @@ class _ClerkAuth:
                 data=dict(data) if data else None,
                 params=params,
                 headers=headers,
+                cookies=self._clerk_cookies(),
                 timeout=DEFAULT_TIMEOUT,
             ) as resp:
                 body_text = await resp.text()
                 if resp.status >= 400:
                     _LOGGER.debug(
-                        "clerk %s returned %s: %s", path, resp.status, body_text[:200]
+                        "clerk %s returned %s", path, resp.status
                     )
                     if resp.status in (400, 401, 403, 422):
                         raise BasePowerAuthError(
-                            f"Clerk {path} returned {resp.status}"
+                            _clerk_error_message(path, resp.status, body_text)
                         )
                     raise BasePowerConnectionError(
                         f"Clerk {path} returned {resp.status}"
                     )
+                self._capture_client_cookie(resp)
                 try:
                     return await resp.json()
                 except aiohttp.ContentTypeError as exc:
@@ -260,32 +296,72 @@ class _ClerkAuth:
         except aiohttp.ClientError as exc:
             raise BasePowerConnectionError(f"network error calling {path}") from exc
 
-    async def sign_in(self) -> None:
-        """Run the Clerk password sign-in flow.
+    def _capture_client_cookie(self, resp: aiohttp.ClientResponse) -> None:
+        """Extract the ``__client`` cookie from a Clerk response if present."""
 
-        After a successful call, :attr:`_session_id` is set.
-        """
+        cookie = resp.cookies.get("__client")
+        if cookie is not None and cookie.value:
+            self._client_id = cookie.value
+
+    async def start_sign_in(self, email: str | None = None) -> None:
+        """Begin Clerk email_code sign-in. Triggers the OTP email."""
+
+        if email is not None:
+            self._email = email
+        if not self._email:
+            raise BasePowerAuthError("email is required to start sign-in")
 
         async with self._lock:
-            # Step 1: create a sign-in attempt.
+            # Step 1: create the sign-in attempt.
             resp = await self._clerk_post(
                 "/v1/client/sign_ins",
+                data={"identifier": self._email},
+            )
+            sign_in = resp.get("response") or resp
+            sign_in_id = sign_in.get("id")
+            if not sign_in_id:
+                raise BasePowerAuthError("Clerk sign_in returned no id")
+            factors = sign_in.get("supported_first_factors") or []
+            email_factor = next(
+                (f for f in factors if f.get("strategy") == "email_code"),
+                None,
+            )
+            if email_factor is None:
+                raise BasePowerAuthError(
+                    "Clerk did not offer email_code factor; unsupported account "
+                    "configuration. Supported factors: "
+                    f"{[f.get('strategy') for f in factors]}"
+                )
+            self._sign_in_id = sign_in_id
+            self._supported_factors = factors
+
+            # Step 2: ask Clerk to actually send the code.
+            await self._clerk_post(
+                f"/v1/client/sign_ins/{sign_in_id}/prepare_first_factor",
                 data={
-                    "identifier": self._email,
-                    "strategy": "password",
-                    "password": self._password,
+                    "strategy": "email_code",
+                    "email_address_id": email_factor.get("email_address_id", ""),
                 },
             )
-            sign_in = resp.get("response") or {}
+
+    async def attempt_sign_in(self, code: str) -> None:
+        """Submit the emailed OTP to complete sign-in."""
+
+        async with self._lock:
+            if not self._sign_in_id:
+                raise BasePowerAuthError(
+                    "attempt_sign_in called before start_sign_in"
+                )
+            resp = await self._clerk_post(
+                f"/v1/client/sign_ins/{self._sign_in_id}/attempt_first_factor",
+                data={"strategy": "email_code", "code": code.strip()},
+            )
+            sign_in = resp.get("response") or resp
             status = sign_in.get("status")
             if status != "complete":
-                # Password-only flows complete immediately. If we got here,
-                # either MFA is required, email verification is pending, or
-                # the backend changed.
                 raise BasePowerAuthError(
-                    f"Clerk sign_in status={status!r}; only password-only flows "
-                    "are supported. If you have 2FA enabled on your Base account, "
-                    "please disable it or file an issue asking for 2FA support."
+                    f"Clerk sign-in status={status!r} (expected 'complete'); "
+                    "code may be incorrect or expired"
                 )
             created_session_id = sign_in.get("created_session_id")
             if not created_session_id:
@@ -293,8 +369,12 @@ class _ClerkAuth:
                     "Clerk sign_in returned no created_session_id"
                 )
             self._session_id = created_session_id
-            # client_id is useful for diagnostics but not required.
-            self._client_id = (resp.get("client") or {}).get("id")
+            if not self._client_id:
+                # Fall back to client.id from the response body if we didn't
+                # capture a Set-Cookie (some Clerk configs don't send one here).
+                self._client_id = (resp.get("client") or {}).get("id")
+            self._sign_in_id = None
+            self._supported_factors = []
             self._jwt = None
             self._jwt_expiry = 0.0
 
@@ -305,7 +385,6 @@ class _ClerkAuth:
         if self._jwt and now < self._jwt_expiry - _TOKEN_LEEWAY_SECONDS:
             return self._jwt
         async with self._lock:
-            # Re-check under the lock in case another waiter refreshed.
             now = time.monotonic()
             if self._jwt and now < self._jwt_expiry - _TOKEN_LEEWAY_SECONDS:
                 return self._jwt
@@ -318,18 +397,40 @@ class _ClerkAuth:
             if not jwt or not isinstance(jwt, str):
                 raise BasePowerAuthError("Clerk /tokens returned no jwt")
             self._jwt = jwt
-            # Tokens last ~60s per Clerk defaults.
+            # Tokens last ~60 s per Clerk defaults.
             self._jwt_expiry = time.monotonic() + 60.0
             return jwt
 
     async def reset(self) -> None:
-        """Drop cached auth state so the next call re-runs sign-in."""
+        """Drop cached JWT so the next call re-mints.
+
+        Does NOT drop ``session_id`` / ``client_id`` — those are the
+        persistent credentials and should only be cleared by a fresh
+        sign-in or explicit logout.
+        """
 
         async with self._lock:
-            self._client_id = None
-            self._session_id = None
             self._jwt = None
             self._jwt_expiry = 0.0
+
+
+def _clerk_error_message(path: str, status: int, body_text: str) -> str:
+    """Produce a user-friendly error from a Clerk 4xx response."""
+
+    try:
+        import json
+
+        data = json.loads(body_text)
+        errs = data.get("errors") or []
+        if errs:
+            first = errs[0]
+            code = first.get("code", "")
+            msg = first.get("long_message") or first.get("message") or ""
+            if msg:
+                return f"Clerk {path} returned {status}: {code}: {msg}"
+    except Exception:  # noqa: BLE001
+        pass
+    return f"Clerk {path} returned {status}"
 
 
 class BasePowerClient:
@@ -338,12 +439,27 @@ class BasePowerClient:
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        email: str,
-        password: str,
+        *,
+        auth: _ClerkAuth | None = None,
+        email: str | None = None,
+        session_id: str | None = None,
+        client_id: str | None = None,
     ) -> None:
         self._session = session
-        self._auth = _ClerkAuth(session, email, password)
+        if auth is not None:
+            self._auth = auth
+        else:
+            self._auth = _ClerkAuth(
+                session,
+                email=email,
+                session_id=session_id,
+                client_id=client_id,
+            )
         self._pool: descriptor_pool.DescriptorPool | None = None
+
+    @property
+    def auth(self) -> _ClerkAuth:
+        return self._auth
 
     async def _registry(self) -> descriptor_pool.DescriptorPool:
         if self._pool is None:
@@ -358,11 +474,6 @@ class BasePowerClient:
         # protobuf 4.x fallback
         factory = message_factory.MessageFactory(self._pool)
         return factory.GetPrototype(descriptor)  # type: ignore[attr-defined]
-
-    async def sign_in(self) -> None:
-        """Authenticate. Safe to call repeatedly."""
-
-        await self._auth.sign_in()
 
     async def _connect_rpc(
         self,

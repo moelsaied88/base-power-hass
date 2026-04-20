@@ -3,21 +3,36 @@
     "step": {
       "user": {
         "title": "Base Power",
-        "description": "Sign in with the email and password you use at account.basepowercompany.com.",
+        "description": "Enter the email address for your Base Power account. We'll ask Base to email you a 6-digit sign-in code.",
         "data": {
-          "email": "Email",
-          "password": "Password"
+          "email": "Email"
+        }
+      },
+      "code": {
+        "title": "Check your email",
+        "description": "Base Power just emailed a 6-digit sign-in code to {email}. Enter it here.",
+        "data": {
+          "code": "Verification code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with Base Power",
+        "description": "Your Base Power session has expired. We've emailed a new 6-digit code to {email}. Enter it here.",
+        "data": {
+          "code": "Verification code"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid email or password.",
+      "invalid_auth": "That email wasn't accepted by Base Power. Double-check it matches your Base account.",
+      "invalid_code": "The code didn't verify. Check the email, try the latest code, or restart the flow to get a new one.",
       "cannot_connect": "Could not reach Base Power. Check your internet connection.",
       "no_locations": "No service locations found on your account.",
       "unknown": "An unexpected error occurred. See the Home Assistant log for details."
     },
     "abort": {
-      "already_configured": "This Base Power account is already configured."
+      "already_configured": "This Base Power account is already configured.",
+      "reauth_successful": "Base Power re-authentication was successful."
     }
   },
   "options": {

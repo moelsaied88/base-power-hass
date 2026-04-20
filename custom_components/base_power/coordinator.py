@@ -19,6 +19,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -35,11 +36,12 @@ from .api import (
 )
 from .const import (
     CONF_ADDRESS_ID,
+    CONF_CLIENT_ID,
     CONF_EMAIL,
-    CONF_PASSWORD,
     CONF_POLL_INTERVAL_GRID,
     CONF_POLL_INTERVAL_OUTAGE,
     CONF_SERVICE_LOCATION_ID,
+    CONF_SESSION_ID,
     DEFAULT_POLL_INTERVAL_GRID,
     DEFAULT_POLL_INTERVAL_OUTAGE,
     DOMAIN,
@@ -85,20 +87,17 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         session = aiohttp_client.async_get_clientsession(hass)
         self.client = BasePowerClient(
-            session=session,
-            email=entry.data[CONF_EMAIL],
-            password=entry.data[CONF_PASSWORD],
+            session,
+            email=entry.data.get(CONF_EMAIL),
+            session_id=entry.data.get(CONF_SESSION_ID),
+            client_id=entry.data.get(CONF_CLIENT_ID),
         )
-        self._signed_in = False
         self._location: ServiceLocation | None = None
         self._last_usage_fetch: float = 0.0
         self._last_outage_state: bool | None = None
         self._last_usage: dict[str, Any] = {}
 
     async def _ensure_auth_and_location(self) -> ServiceLocation:
-        if not self._signed_in:
-            await self.client.sign_in()
-            self._signed_in = True
         if self._location is None:
             address_id = self.entry.data.get(CONF_ADDRESS_ID)
             stored_sl_id = self.entry.data.get(CONF_SERVICE_LOCATION_ID)
@@ -124,8 +123,8 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 location.service_location_id
             )
         except BasePowerAuthError as exc:
-            self._signed_in = False
-            raise UpdateFailed(f"Authentication failed: {exc}") from exc
+            # Clerk session expired/revoked - trigger reauth flow in the UI.
+            raise ConfigEntryAuthFailed(str(exc)) from exc
         except BasePowerConnectionError as exc:
             raise UpdateFailed(f"Connection error: {exc}") from exc
         except BasePowerProtocolError as exc:
