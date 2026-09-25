@@ -9,7 +9,7 @@ from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
@@ -40,9 +40,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             DOMAIN, match_context={"source": SOURCE_REAUTH}
         )
         if not flows:
-            raise ServiceValidationError(
-                "No Base Power re-authentication is waiting for a code"
-            )
+            # Not an error: n8n forwards every Base sign-in email, and HA's
+            # REST API turns service exceptions into 500s with tracebacks.
+            _LOGGER.debug("submit_code ignored: no reauth is pending")
+            return
 
         code = call.data[CONF_CODE]
         failures: list[str] = []

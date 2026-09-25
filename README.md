@@ -82,8 +82,8 @@ Content-Type: application/json
 {"code": "123456"}
 ```
 
-The service returns an error (and does nothing) when no re-auth is pending or
-Base rejects the code, so stray sign-in emails are harmless.
+The service quietly does nothing when no re-auth is pending, so stray sign-in
+emails are harmless. It fails (HTTP 500) only if Base rejects the code.
 
 An importable n8n workflow is in
 [`examples/n8n/base-power-reauth.json`](examples/n8n/base-power-reauth.json):
