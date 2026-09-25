@@ -119,16 +119,19 @@ class BasePowerConfigFlow(ConfigFlow, domain=DOMAIN):
             session = aiohttp_client.async_get_clientsession(self.hass)
             client = BasePowerClient(session, auth=self._auth)
 
+            service_location = None
             try:
                 await self._auth.attempt_sign_in(code)
-                locations = await client.get_available_locations()
-                if not locations:
-                    errors["base"] = "no_locations"
-                else:
-                    first = locations[0]
-                    service_location = await client.resolve_service_location(
-                        first.address_id
-                    )
+                # Reauth keeps the address/service location already stored on
+                # the entry, so only a fresh setup needs location discovery.
+                if self._reauth_entry is None:
+                    locations = await client.get_available_locations()
+                    if not locations:
+                        errors["base"] = "no_locations"
+                    else:
+                        service_location = await client.resolve_service_location(
+                            locations[0].address_id
+                        )
             except BasePowerAuthError as exc:
                 _LOGGER.debug("code verification failed: %s", exc)
                 errors["base"] = "invalid_code"
@@ -137,27 +140,27 @@ class BasePowerConfigFlow(ConfigFlow, domain=DOMAIN):
             except BasePowerError as exc:
                 _LOGGER.exception("unexpected error verifying code: %s", exc)
                 errors["base"] = "unknown"
-            else:
+
+            if not errors and self._reauth_entry is not None:
+                self.hass.config_entries.async_update_entry(
+                    self._reauth_entry,
+                    data={
+                        **self._reauth_entry.data,
+                        CONF_EMAIL: self._email,
+                        CONF_SESSION_ID: self._auth.session_id,
+                        CONF_CLIENT_ID: self._auth.client_id,
+                    },
+                )
+                await self.hass.config_entries.async_reload(
+                    self._reauth_entry.entry_id
+                )
+                return self.async_abort(reason="reauth_successful")
+
+            if not errors and service_location is not None:
                 unique_id = (
                     f"{self._email.lower()}::"
                     f"{service_location.service_location_id}"
                 )
-
-                if self._reauth_entry is not None:
-                    self.hass.config_entries.async_update_entry(
-                        self._reauth_entry,
-                        data={
-                            **self._reauth_entry.data,
-                            CONF_EMAIL: self._email,
-                            CONF_SESSION_ID: self._auth.session_id,
-                            CONF_CLIENT_ID: self._auth.client_id,
-                        },
-                    )
-                    await self.hass.config_entries.async_reload(
-                        self._reauth_entry.entry_id
-                    )
-                    return self.async_abort(reason="reauth_successful")
-
                 await self.async_set_unique_id(unique_id)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(

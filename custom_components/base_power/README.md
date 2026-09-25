@@ -2,7 +2,7 @@
 
 Read-only Home Assistant integration for [Base Power Company](https://basepowercompany.com/) customers (Texas electricity + home battery). Exposes live battery state, grid-outage detection, and energy flow as HA entities.
 
-> **Unofficial.** Base Power does not publish a public API. This integration speaks to the same ConnectRPC endpoints their web dashboard uses at `account.basepowercompany.com`. If Base changes those endpoints it will break; rerun the schema capture tool (`tools/base_power_capture/`) to rebuild.
+> **Unofficial.** Base Power does not publish a public API. This integration speaks to the same JSON endpoints the Base Android app uses at `dashboard.baseapis.net`. If Base changes those endpoints it will break; rerun the schema capture tool (`tools/base_power_capture/`) to rebuild.
 
 ## Entities
 
@@ -54,7 +54,7 @@ Base Power uses [Clerk](https://clerk.com) for identity. The integration:
 1. Signs in with email/password using Clerk's `/v1/client/sign_ins` endpoint.
 2. Stores the resulting Clerk `session_id` in memory only.
 3. Mints a fresh 60-second JWT from `/v1/client/sessions/<sid>/tokens` for every API request window.
-4. Passes the JWT as `Authorization: Bearer <jwt>` on ConnectRPC calls.
+4. Passes the raw JWT in the `authorization` header on mobile API calls, matching the Android app.
 
 Credentials are stored encrypted in Home Assistant's config entry store. The integration never writes credentials to logs.
 
@@ -83,8 +83,10 @@ Base Power's web dashboard is a Next.js SPA that talks to a ConnectRPC (protobuf
 This integration:
 
 1. Bundles a `file_descriptors.bin` FileDescriptorSet extracted from the SPA's JS bundle (see `tools/base_power_capture/extract_schema.py`).
-2. Builds a runtime `DescriptorPool` + `MessageFactory` on first load, so we can encode/decode protobuf messages without protoc-generated `_pb2.py` files.
-3. Sends `application/proto` requests with the required `connect-protocol-version: 1` header.
+2. Builds a runtime `DescriptorPool` + `MessageFactory` on first load, so we can decode protobuf messages without protoc-generated `_pb2.py` files.
+3. Calls the mobile app's JSON endpoints at `dashboard.baseapis.net/<Method>` and parses the replies (protobuf JSON mapping) into those message types.
+
+The web dashboard's old ConnectRPC proxy at `account.basepowercompany.com/api/connect` was retired in September 2026 and now only serves HTML.
 
 If Base Power ever changes their schema, rerun the capture tool and copy the regenerated `file_descriptors.bin` back into this directory - no code changes needed as long as the field names stay stable.
 

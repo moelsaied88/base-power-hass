@@ -7,16 +7,16 @@ Two-layer design:
   the user enters their email, Clerk emails a 6-digit code, we exchange the
   code for a long-lived Clerk ``session_id``. Subsequent API calls mint
   short-lived JWTs via ``/v1/client/sessions/{sid}/tokens``.
-* `BasePowerClient` wraps Clerk auth and provides typed access to the
-  ConnectRPC endpoints exposed by `account.basepowercompany.com/api/connect/*`.
+* `BasePowerClient` wraps Clerk auth and provides typed access to the mobile
+  app's JSON endpoints at `dashboard.baseapis.net/<Method>`.
 
 Clerk's token endpoint requires the ``__client`` cookie set during sign-in.
 We capture it from the sign-in response and persist it in the config entry
 alongside ``session_id`` so JWT minting survives HA restarts.
 
-Requests are encoded as binary protobuf (Content-Type: application/proto,
-connect-protocol-version: 1). Message classes are built at runtime from the
-FileDescriptorSet shipped inside this component (``file_descriptors.bin``).
+Some JSON responses are parsed into protobuf messages built at runtime from
+the FileDescriptorSet shipped inside this component (``file_descriptors.bin``)
+so field access stays typed.
 
 Nothing in this module logs credentials, codes, JWTs, or full response bodies.
 """
@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import aiohttp
-from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf import (
+    descriptor_pb2,
+    descriptor_pool,
+    json_format,
+    message_factory,
+)
 
 try:  # protobuf 5.x
     from google.protobuf.message_factory import GetMessageClass as _get_message_class
@@ -43,7 +48,6 @@ _LOGGER = logging.getLogger(__name__)
 
 ACCOUNT_ORIGIN = "https://account.basepowercompany.com"
 CLERK_ORIGIN = "https://clerk.basepowercompany.com"
-CONNECT_BASE = f"{ACCOUNT_ORIGIN}/api/connect"
 
 # Mobile app REST/JSON API. Extracted from the Android app (v1.10.1) Hermes
 # bundle at dashboard.baseapis.net: it exposes a superset of the web Connect
@@ -54,10 +58,6 @@ BASE_MOBILE_ORIGIN = "https://dashboard.baseapis.net"
 # Observed from the web SPA - passed as query params on every Clerk request.
 CLERK_API_VERSION = "2025-11-10"
 CLERK_JS_VERSION = "5.125.9"
-
-# Connect-RPC required headers.
-CONNECT_CONTENT_TYPE = "application/proto"
-CONNECT_PROTO_VERSION = "1"
 
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
@@ -481,58 +481,28 @@ class BasePowerClient:
         factory = message_factory.MessageFactory(self._pool)
         return factory.GetPrototype(descriptor)  # type: ignore[attr-defined]
 
-    async def _connect_rpc(
+    async def _mobile_rpc(
         self,
-        service: str,
-        method: str,
-        request_type: str,
+        endpoint: str,
         response_type: str,
-        request_fields: Mapping[str, Any] | None = None,
+        *,
+        method: str = "POST",
+        body: Mapping[str, Any] | None = None,
     ) -> Any:
-        """Issue a Connect-RPC call with binary protobuf encoding."""
+        """Call a mobile JSON endpoint and parse the reply into ``response_type``.
+
+        The mobile API speaks the protobuf JSON mapping, so the bundled
+        descriptors describe its responses exactly.
+        """
 
         await self._registry()
-        RequestCls = self._message_class(request_type)
         ResponseCls = self._message_class(response_type)
-
-        req_msg = RequestCls()
-        if request_fields:
-            for k, v in request_fields.items():
-                setattr(req_msg, k, v)
-        body = req_msg.SerializeToString()
-
-        jwt = await self._auth.get_jwt()
-        headers = {
-            "Content-Type": CONNECT_CONTENT_TYPE,
-            "Accept": CONNECT_CONTENT_TYPE,
-            "Connect-Protocol-Version": CONNECT_PROTO_VERSION,
-            "Authorization": f"Bearer {jwt}",
-            "User-Agent": _user_agent(),
-            "Origin": ACCOUNT_ORIGIN,
-            "Referer": f"{ACCOUNT_ORIGIN}/",
-        }
-        url = f"{CONNECT_BASE}/dashboard/{service}/{method}"
-        try:
-            async with self._session.post(
-                url, data=body, headers=headers, timeout=DEFAULT_TIMEOUT
-            ) as resp:
-                if resp.status == 401:
-                    # Clerk token rotation; force re-sign-in once then retry.
-                    await self._auth.reset()
-                    raise BasePowerAuthError("401 from Base API")
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise BasePowerProtocolError(
-                        f"{method} returned {resp.status}: {text[:200]}"
-                    )
-                raw = await resp.read()
-        except aiohttp.ClientError as exc:
-            raise BasePowerConnectionError(f"network error calling {method}") from exc
+        data = await self._mobile_json(endpoint, method=method, body=body)
 
         resp_msg = ResponseCls()
         try:
-            resp_msg.ParseFromString(raw)
-        except Exception as exc:  # noqa: BLE001
+            json_format.ParseDict(data, resp_msg, ignore_unknown_fields=True)
+        except json_format.ParseError as exc:
             raise BasePowerProtocolError(
                 f"failed to parse {response_type}: {exc}"
             ) from exc
@@ -547,11 +517,10 @@ class BasePowerClient:
         ``addressId`` but not yet a numeric ``serviceLocationId``.
         """
 
-        resp = await self._connect_rpc(
-            service="dashboard.DashboardAPI",
-            method="GetAvailableLocations",
-            request_type="google.protobuf.Empty",
-            response_type="dashboard.GetAvailableLocationsResponse",
+        resp = await self._mobile_rpc(
+            "MobileGetAvailableLocations",
+            "dashboard.MobileGetAvailableLocationsResponse",
+            method="GET",
         )
         return [
             AvailableLocation(
@@ -564,12 +533,10 @@ class BasePowerClient:
     async def resolve_service_location(self, address_id: str) -> ServiceLocation:
         """Step 2: given an addressId, fetch the numeric serviceLocationId."""
 
-        resp = await self._connect_rpc(
-            service="dashboard.DashboardAPI",
-            method="MobileGetDashboardRoot",
-            request_type="dashboard.MobileGetDashboardRootRequest",
-            response_type="dashboard.MobileGetDashboardRootResponse",
-            request_fields={"addressId": address_id, "newReferralsEnabled": False},
+        resp = await self._mobile_rpc(
+            "MobileGetDashboardRoot",
+            "dashboard.MobileGetDashboardRootResponse",
+            body={"addressId": address_id, "newReferralsEnabled": False},
         )
         return ServiceLocation(
             service_location_id=int(resp.serviceLocationId),
@@ -758,12 +725,10 @@ class BasePowerClient:
     async def get_recent_usage(self, address_id: str) -> dict[str, Any]:
         """Return recent time-series usage (power, energy, outage events)."""
 
-        resp = await self._connect_rpc(
-            service="dashboard.DashboardAPI",
-            method="MobileGetRecentUsage",
-            request_type="dashboard.MobileGetRecentUsageRequest",
-            response_type="dashboard.MobileGetRecentUsageResponse",
-            request_fields={"address_id": address_id},
+        resp = await self._mobile_rpc(
+            "MobileGetRecentUsage",
+            "dashboard.MobileGetRecentUsageResponse",
+            body={"addressId": address_id},
         )
 
         def ts(pt: Any) -> int | None:
