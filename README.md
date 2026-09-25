@@ -67,13 +67,38 @@ dashboard computes from them will include arbitrage flows.
 > rolling-window totals that can decrease as the window slides, which would
 > corrupt long-term statistics.
 
+## Automatic re-authentication (v0.7.3+)
+
+When Base rejects the stored session, Home Assistant opens a re-auth prompt
+and Base immediately emails a new 6-digit code. Instead of typing it in, you
+can have something read the email and call the `base_power.submit_code`
+service, which answers the pending prompt:
+
+```http
+POST /api/services/base_power/submit_code
+Authorization: Bearer <long-lived access token>
+Content-Type: application/json
+
+{"code": "123456"}
+```
+
+The service returns an error (and does nothing) when no re-auth is pending or
+Base rejects the code, so stray sign-in emails are harmless.
+
+An importable n8n workflow is in
+[`examples/n8n/base-power-reauth.json`](examples/n8n/base-power-reauth.json):
+Gmail Trigger, a Code node that extracts the code, and an HTTP Request to the
+service. After importing, pick your Gmail credential, create an HTTP Header
+Auth credential (`Authorization` / `Bearer <token>`), and replace
+`YOUR-HOME-ASSISTANT` with your HA URL.
+
 ## How it works
 
 See [`custom_components/base_power/README.md`](custom_components/base_power/README.md) for architecture details, entity list, diagnostics/privacy notes, and limitations.
 
 ## Disclaimer
 
-This is an **unofficial** integration. Base Power doesn't publish a public API; this integration talks to the private ConnectRPC endpoints used by their web/mobile dashboard. Expect occasional breakage when Base updates their backend. No warranty.
+This is an **unofficial** integration. Base Power doesn't publish a public API; this integration talks to the private API used by their mobile app. Expect occasional breakage when Base updates their backend. No warranty.
 
 ## License
 

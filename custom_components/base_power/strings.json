@@ -47,5 +47,17 @@
         }
       }
     }
+  },
+  "services": {
+    "submit_code": {
+      "name": "Submit verification code",
+      "description": "Answers a pending Base Power re-authentication with the 6-digit code Base emailed you. Lets tools like n8n finish re-auth without opening the dialog.",
+      "fields": {
+        "code": {
+          "name": "Code",
+          "description": "The 6-digit code from the Base Power sign-in email."
+        }
+      }
+    }
   }
 }

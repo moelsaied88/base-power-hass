@@ -31,5 +31,7 @@ MAX_POLL_INTERVAL: Final = timedelta(minutes=10)
 MANUFACTURER: Final = "Base Power Company"
 MODEL: Final = "Base Battery"
 
+SERVICE_SUBMIT_CODE: Final = "submit_code"
+
 EVENT_OUTAGE_STARTED: Final = f"{DOMAIN}_outage_started"
 EVENT_OUTAGE_ENDED: Final = f"{DOMAIN}_outage_ended"

@@ -285,7 +285,7 @@ class _ClerkAuth:
                     _LOGGER.debug(
                         "clerk %s returned %s", path, resp.status
                     )
-                    if resp.status in (400, 401, 403, 422):
+                    if resp.status in (400, 401, 403, 404, 422):
                         raise BasePowerAuthError(
                             _clerk_error_message(path, resp.status, body_text)
                         )
@@ -559,44 +559,56 @@ class BasePowerClient:
         Matches how the official Android app's ``fetchWithAuth`` wrapper
         formats requests: ``${host}/${endpoint}`` with a raw Clerk JWT in the
         ``authorization`` header (no ``Bearer`` prefix), JSON body.
+
+        A 401 is retried once with a freshly minted JWT: Base sometimes
+        rejects a token before our local expiry estimate, and raising
+        ``BasePowerAuthError`` makes HA stop polling and demand a new code.
         """
 
-        jwt = await self._auth.get_jwt()
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            # The Android client sends the raw JWT, not "Bearer <jwt>".
-            # Kept exactly the same here so our traffic pattern matches.
-            "authorization": jwt,
-            "User-Agent": _user_agent(),
-        }
         url = f"{BASE_MOBILE_ORIGIN}/{endpoint}"
-        try:
-            async with self._session.request(
-                method,
-                url,
-                json=dict(body) if body is not None else None,
-                headers=headers,
-                timeout=DEFAULT_TIMEOUT,
-            ) as resp:
-                if resp.status == 401:
-                    await self._auth.reset()
-                    raise BasePowerAuthError(f"401 from {endpoint}")
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise BasePowerProtocolError(
-                        f"{endpoint} returned {resp.status}: {text[:200]}"
-                    )
-                try:
-                    return await resp.json()
-                except aiohttp.ContentTypeError as exc:
-                    raise BasePowerProtocolError(
-                        f"{endpoint} returned non-JSON body"
-                    ) from exc
-        except aiohttp.ClientError as exc:
-            raise BasePowerConnectionError(
-                f"network error calling {endpoint}"
-            ) from exc
+        for attempt in range(2):
+            jwt = await self._auth.get_jwt()
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                # The Android client sends the raw JWT, not "Bearer <jwt>".
+                # Kept exactly the same here so our traffic pattern matches.
+                "authorization": jwt,
+                "User-Agent": _user_agent(),
+            }
+            try:
+                async with self._session.request(
+                    method,
+                    url,
+                    json=dict(body) if body is not None else None,
+                    headers=headers,
+                    timeout=DEFAULT_TIMEOUT,
+                ) as resp:
+                    if resp.status == 401:
+                        await self._auth.reset()
+                        if attempt == 0:
+                            _LOGGER.debug(
+                                "401 from %s; retrying with a fresh token",
+                                endpoint,
+                            )
+                            continue
+                        raise BasePowerAuthError(f"401 from {endpoint}")
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        raise BasePowerProtocolError(
+                            f"{endpoint} returned {resp.status}: {text[:200]}"
+                        )
+                    try:
+                        return await resp.json()
+                    except aiohttp.ContentTypeError as exc:
+                        raise BasePowerProtocolError(
+                            f"{endpoint} returned non-JSON body"
+                        ) from exc
+            except aiohttp.ClientError as exc:
+                raise BasePowerConnectionError(
+                    f"network error calling {endpoint}"
+                ) from exc
+        raise AssertionError("unreachable")
 
     async def get_service_context(
         self, service_location_id: int

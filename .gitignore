@@ -6,3 +6,6 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+
+# Personal copies with a real Home Assistant URL
+*.local.json

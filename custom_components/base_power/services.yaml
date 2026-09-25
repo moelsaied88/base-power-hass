@@ -1,0 +1,7 @@
+submit_code:
+  fields:
+    code:
+      required: true
+      example: "123456"
+      selector:
+        text:

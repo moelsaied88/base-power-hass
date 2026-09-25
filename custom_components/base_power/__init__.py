@@ -4,17 +4,69 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.config_entries import ConfigEntry
+import voluptuous as vol
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
+from .const import CONF_CODE, DOMAIN, SERVICE_SUBMIT_CODE
 from .coordinator import BasePowerCoordinator
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+SUBMIT_CODE_SCHEMA = vol.Schema(
+    {vol.Required(CONF_CODE): vol.All(cv.string, vol.Strip, vol.Match(r"^\d{6}$"))}
+)
+
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the integration-wide ``submit_code`` service.
+
+    Lets an external tool (n8n, an IMAP automation, ...) answer a pending
+    reauth flow with the emailed code, since HA's REST API can't list flows.
+    """
+
+    async def _async_submit_code(call: ServiceCall) -> None:
+        flows = hass.config_entries.flow.async_progress_by_handler(
+            DOMAIN, match_context={"source": SOURCE_REAUTH}
+        )
+        if not flows:
+            raise ServiceValidationError(
+                "No Base Power re-authentication is waiting for a code"
+            )
+
+        code = call.data[CONF_CODE]
+        failures: list[str] = []
+        for flow in flows:
+            result = await hass.config_entries.flow.async_configure(
+                flow["flow_id"], {CONF_CODE: code}
+            )
+            if (
+                result["type"] is FlowResultType.ABORT
+                and result.get("reason") == "reauth_successful"
+            ):
+                _LOGGER.info("Base Power re-authenticated via submit_code")
+                return
+            errors = result.get("errors") or {}
+            failures.append(errors.get("base") or str(result.get("reason")))
+
+        raise HomeAssistantError(
+            f"Base Power did not accept the code: {', '.join(failures)}"
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_SUBMIT_CODE, _async_submit_code, schema=SUBMIT_CODE_SCHEMA
+    )
+    return True
 
 
 def _migrate_entity_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:

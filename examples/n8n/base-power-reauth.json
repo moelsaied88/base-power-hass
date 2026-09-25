@@ -1,0 +1,81 @@
+{
+  "name": "Base Power: auto-submit re-auth code",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "basepowercompany newer_than:1h"
+        },
+        "options": {}
+      },
+      "id": "7c1f4d2e-8a51-4b8e-9d1e-1b0f3c2a5e01",
+      "name": "Base sign-in email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull the 6-digit code out of Base Power / Clerk sign-in emails.\n// Emails that don't mention a code are dropped, so newsletters are ignored.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const subject = String(j.subject ?? j.Subject ?? '');\n  const snippet = String(j.snippet ?? '');\n  if (!/code/i.test(`${subject} ${snippet}`)) continue;\n  const haystack = [subject, snippet, String(j.text ?? '')].join('\\n');\n  const match = haystack.match(/\\b(\\d{6})\\b/);\n  if (match) out.push({ json: { code: match[1], subject } });\n}\nreturn out;\n"
+      },
+      "id": "2b9e6a41-3c7d-4f0a-a8e2-6d5b1c9f7e02",
+      "name": "Extract code",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-HOME-ASSISTANT/api/services/base_power/submit_code",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ code: $json.code }) }}",
+        "options": {}
+      },
+      "id": "e4a8c3f1-6b2d-4e9a-b7c5-3f1d8a2e6b03",
+      "name": "Submit to Home Assistant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Base sign-in email": {
+      "main": [
+        [
+          {
+            "node": "Extract code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract code": {
+      "main": [
+        [
+          {
+            "node": "Submit to Home Assistant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
