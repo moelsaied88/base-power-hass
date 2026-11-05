@@ -9,3 +9,4 @@ venv/
 
 # Personal copies with a real Home Assistant URL
 *.local.json
+.pytest_cache/
