@@ -25,6 +25,9 @@ class BasePowerBinaryDescription(BinarySensorEntityDescription):
     """Describes a Base Power binary sensor."""
 
     is_on_fn: Callable[[dict[str, Any]], bool | None]
+    # Set on entities added after v0.7.4 so their entity_id follows the
+    # base_power_* pattern instead of the device name, which is the address.
+    object_id: str | None = None
 
 
 def _ctx(data: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +40,7 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         name="On Battery",
         icon="mdi:battery-alert",
         device_class=BinarySensorDeviceClass.POWER,
-        is_on_fn=lambda data: _ctx(data).get("active_outage"),
+        is_on_fn=lambda data: _ctx(data).get("outage"),
     ),
     # Track the home's actual power status as reported by Base's gateway.
     # Flips to False during an outage while the house still runs on battery.
@@ -54,9 +57,7 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         icon="mdi:transmission-tower",
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         is_on_fn=lambda data: (
-            None
-            if _ctx(data).get("active_outage") is None
-            else not _ctx(data).get("active_outage")
+            None if _ctx(data).get("outage") is None else not _ctx(data).get("outage")
         ),
     ),
     BasePowerBinaryDescription(
@@ -80,6 +81,15 @@ BINARY_SENSORS: tuple[BasePowerBinaryDescription, ...] = (
         entity_registry_enabled_default=False,
         device_class=BinarySensorDeviceClass.PROBLEM,
         is_on_fn=lambda data: _ctx(data).get("active_overcurrent_standby"),
+    ),
+    # The event list refreshes every 15 minutes, so this can lag by that much.
+    BasePowerBinaryDescription(
+        key="grid_support",
+        name="Grid Support",
+        icon="mdi:transmission-tower-import",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        is_on_fn=lambda data: (data.get("v2") or {}).get("grid_support_active"),
+        object_id="base_power_grid_support",
     ),
 )
 
@@ -112,6 +122,8 @@ class BasePowerBinarySensor(
         self.entity_description = description
         sl_id = coordinator.entry.data.get("service_location_id", "unknown")
         self._attr_unique_id = f"base_power_{sl_id}_{description.key}"
+        if description.object_id:
+            self.entity_id = f"binary_sensor.{description.object_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, str(sl_id))},
             manufacturer=MANUFACTURER,
@@ -135,3 +147,21 @@ class BasePowerBinarySensor(
             return self.entity_description.is_on_fn(data)
         except (KeyError, AttributeError, TypeError):
             return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Show what decided an outage, so a wrong state can be diagnosed."""
+        if self.entity_description.key not in ("on_battery", "grid_connected"):
+            return None
+        data = self.coordinator.data
+        if not data:
+            return None
+        ctx = _ctx(data)
+        return {
+            "decided_by": ctx.get("outage_source"),
+            "active_outage_flag": ctx.get("active_outage"),
+            "grid_voltage_source": ctx.get("grid_voltage_source"),
+            "battery_state": ((data.get("v2") or {}).get("snapshot") or {}).get(
+                "state"
+            ),
+        }

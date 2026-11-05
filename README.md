@@ -2,16 +2,16 @@
 
 Unofficial Home Assistant integration for [Base Power](https://basepowercompany.com/) residential battery / grid-backup service.
 
-Reverse-engineers the Base Power mobile dashboard's ConnectRPC/Protobuf API to expose:
+Uses the private API behind the Base Power mobile app to expose:
 
-- **Battery state of energy** (`%`)
-- **Home power draw** (`kW`)
+- **Battery state of energy** (`%`) and backup runtime
+- **Live power** (`W`) for home, grid, battery, and solar
 - **Grid voltage** (`V`)
-- **On-battery / grid-connected / gateway-connected** binary sensors
-- **Energy totals** (grid/solar/storage → home, kWh)
-- **Outage transition events** fired on HA event bus for fast automations
+- **On-battery, grid-connected, and gateway-connected** binary sensors
+- **Battery state, grid support events, and bill and cost sensors** from Base's newer API
+- **Outage transition events** on the HA event bus for fast automations
 
-Adaptive polling: 60s normal, 10s while on battery.
+Polling adapts between a grid interval and a faster outage interval, both configurable in the integration options. See [how it works](custom_components/base_power/README.md) for each schedule.
 
 ## Installation via HACS
 
@@ -20,7 +20,7 @@ Adaptive polling: 60s normal, 10s while on battery.
 3. Install "Base Power"
 4. Restart Home Assistant
 5. Settings → Devices & Services → Add Integration → search "Base Power"
-6. Enter your Base Power account email + password
+6. Enter your Base Power account email, then the 6-digit code Base emails you
 
 ## Energy Dashboard setup
 
@@ -92,6 +92,15 @@ service. After importing, pick your Gmail credential, create an HTTP Header
 Auth credential (`Authorization` / `Bearer <token>`), and replace
 `YOUR-HOME-ASSISTANT` with your HA URL.
 
+## Development
+
+```shell
+pip install -r requirements_test.txt
+pytest
+```
+
+The tests run against a real Home Assistant core with a fake Base client.
+
 ## How it works
 
 See [`custom_components/base_power/README.md`](custom_components/base_power/README.md) for architecture details, entity list, diagnostics/privacy notes, and limitations.
@@ -102,4 +111,6 @@ This is an **unofficial** integration. Base Power doesn't publish a public API; 
 
 ## License
 
-MIT
+MIT. Parts of the newer-API support are adapted from
+[jerrit/ha-base-power](https://github.com/jerrit/ha-base-power). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

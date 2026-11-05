@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 from homeassistant.components.sensor import (
@@ -13,6 +14,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    EntityCategory,
     PERCENTAGE,
     UnitOfElectricPotential,
     UnitOfEnergy,
@@ -24,6 +26,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .api_v2 import BATTERY_STATES
 from .const import DOMAIN, MANUFACTURER, MODEL
 from .coordinator import BasePowerCoordinator
 
@@ -32,11 +35,22 @@ from .coordinator import BasePowerCoordinator
 class BasePowerSensorDescription(SensorEntityDescription):
     """Describes a Base Power sensor and how to pull its value from data."""
 
-    value_fn: Callable[[dict[str, Any]], float | int | None]
+    value_fn: Callable[[dict[str, Any]], float | int | str | None]
+    # Set on entities added after v0.7.4 so their entity_id follows the
+    # base_power_* pattern instead of the device name, which is the address.
+    object_id: str | None = None
 
 
 def _ctx(data: dict[str, Any]) -> dict[str, Any]:
     return data.get("context") or {}
+
+
+def _v2(data: dict[str, Any], key: str) -> dict[str, Any]:
+    return (data.get("v2") or {}).get(key) or {}
+
+
+def _dollars(cents: float | int | None) -> float | None:
+    return None if cents is None else round(cents / 100, 2)
 
 
 SENSORS: tuple[BasePowerSensorDescription, ...] = (
@@ -200,7 +214,6 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
     ),
     # Derived total capacity. availableBackupAt750W scales linearly with SoE,
     # so dividing remaining kWh by SoE fraction gives the full-charge number.
-    # For a dual-battery install this is ~33 kWh (two ~16-17 kWh units).
     BasePowerSensorDescription(
         key="battery_capacity",
         name="Battery Capacity (at 100%)",
@@ -251,7 +264,98 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
             (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
         ).get("storage_to_home"),
     ),
+    # dashboard.mobile.v2 sensors. Bill and cost amounts need an account billed
+    # by Base, and stay unavailable otherwise.
+    BasePowerSensorDescription(
+        key="battery_state",
+        name="Battery State",
+        icon="mdi:home-battery",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(BATTERY_STATES.values()),
+        value_fn=lambda data: _v2(data, "snapshot").get("state"),
+        object_id="base_power_battery_state",
+    ),
+    BasePowerSensorDescription(
+        key="grid_support_events_24h",
+        name="Grid Support Events (24 h)",
+        icon="mdi:transmission-tower-import",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: (
+            len(_v2(data, "overview")["grid_support"])
+            if _v2(data, "overview").get("available")
+            else None
+        ),
+        object_id="base_power_grid_support_events_24h",
+    ),
+    BasePowerSensorDescription(
+        key="energy_cost_today",
+        name="Energy Cost Today",
+        icon="mdi:currency-usd",
+        native_unit_of_measurement="USD",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        value_fn=lambda data: _dollars(_v2(data, "overview").get("cost_today_cents")),
+        object_id="base_power_energy_cost_today",
+    ),
+    BasePowerSensorDescription(
+        key="bill_to_date",
+        name="Bill to Date",
+        icon="mdi:receipt-text",
+        native_unit_of_measurement="USD",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        value_fn=lambda data: _dollars(
+            _v2(data, "billing_cycle").get("net_accrued_cents")
+        ),
+        object_id="base_power_bill_to_date",
+    ),
+    BasePowerSensorDescription(
+        key="projected_bill",
+        name="Projected Bill",
+        icon="mdi:receipt-text-clock",
+        native_unit_of_measurement="USD",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        value_fn=lambda data: _dollars(
+            _v2(data, "billing_cycle").get("projected_charges_cents")
+        ),
+        object_id="base_power_projected_bill",
+    ),
+    BasePowerSensorDescription(
+        key="solar_buyback_credit",
+        name="Solar Buyback Credit",
+        icon="mdi:solar-power",
+        native_unit_of_measurement="USD",
+        device_class=SensorDeviceClass.MONETARY,
+        suggested_display_precision=2,
+        value_fn=lambda data: _dollars(
+            _v2(data, "billing_cycle").get("solar_credit_cents")
+        ),
+        object_id="base_power_solar_buyback_credit",
+    ),
+    # Health of the newer API, so a phase-out of either API is visible early.
+    BasePowerSensorDescription(
+        key="v2_api_status",
+        name="Newer API Status",
+        icon="mdi:api",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=["ok", "degraded", "failing"],
+        value_fn=lambda data: _v2_api_status(data),
+        object_id="base_power_newer_api_status",
+    ),
 )
+
+
+def _v2_api_status(data: dict[str, Any]) -> str | None:
+    """Summarize v2 calls: all working, some failing, or all failing."""
+    health = _v2(data, "health")
+    if not health:
+        return None
+    failing = sum(1 for call in health.values() if call.get("last_error"))
+    if not failing:
+        return "ok"
+    return "failing" if failing == len(health) else "degraded"
 
 
 def _charge_power_w(data: dict[str, Any]) -> float | None:
@@ -368,6 +472,12 @@ def _full_battery_capacity_kwh(data: dict[str, Any]) -> float | None:
     return remaining / soe_fraction
 
 
+def _iso(seconds: int | None) -> str | None:
+    if seconds is None:
+        return None
+    return datetime.fromtimestamp(seconds, UTC).isoformat()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -393,6 +503,8 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
         self.entity_description = description
         sl_id = coordinator.entry.data.get("service_location_id", "unknown")
         self._attr_unique_id = f"base_power_{sl_id}_{description.key}"
+        if description.object_id:
+            self.entity_id = f"sensor.{description.object_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, str(sl_id))},
             manufacturer=MANUFACTURER,
@@ -457,5 +569,38 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
         if key == "battery_state_of_energy":
             return {
                 "bucket": ctx.get("state_of_energy_bucket"),
+            }
+        if key == "battery_state":
+            snapshot = _v2(data, "snapshot")
+            return {
+                "observed_at": _iso(snapshot.get("observed_at")),
+                "state_of_energy_percent": snapshot.get("state_of_energy_percent"),
+                "overcurrent_limit_kw": snapshot.get("overcurrent_limit_kw"),
+                "backup_hours": snapshot.get("backup_hours"),
+                "backup_hours_750w": snapshot.get("backup_hours_750w"),
+                "power_flow": snapshot.get("power_flow"),
+            }
+        if key == "grid_support_events_24h":
+            intervals = _v2(data, "overview").get("grid_support") or []
+            if not intervals:
+                return None
+            latest = max(intervals, key=lambda item: item.get("start") or 0)
+            return {
+                "last_start": _iso(latest.get("start")),
+                "last_end": _iso(latest.get("end")),
+            }
+        if key == "energy_cost_today":
+            return {"energy_mix_24h": _v2(data, "overview").get("energy_mix_24h")}
+        if key in ("bill_to_date", "projected_bill", "solar_buyback_credit"):
+            cycle = _v2(data, "billing_cycle")
+            return {
+                "service_period_start": _iso(cycle.get("service_period_start")),
+                "data_through": _iso(cycle.get("data_through")),
+                "gross_charges": _dollars(cycle.get("gross_charges_cents")),
+            }
+        if key == "v2_api_status":
+            return {
+                "calls": _v2(data, "health"),
+                "readings_source": ctx.get("source"),
             }
         return None

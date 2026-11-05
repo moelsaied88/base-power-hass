@@ -27,6 +27,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
@@ -43,6 +44,8 @@ try:  # protobuf 5.x
     from google.protobuf.message_factory import GetMessageClass as _get_message_class
 except ImportError:  # pragma: no cover - fallback for older protobuf
     _get_message_class = None
+
+from . import api_v2
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -604,11 +607,111 @@ class BasePowerClient:
                         raise BasePowerProtocolError(
                             f"{endpoint} returned non-JSON body"
                         ) from exc
-            except aiohttp.ClientError as exc:
+            except (aiohttp.ClientError, TimeoutError) as exc:
                 raise BasePowerConnectionError(
                     f"network error calling {endpoint}"
                 ) from exc
         raise AssertionError("unreachable")
+
+    async def _grpc_web_call(
+        self, service: str, method: str, payload: bytes
+    ) -> bytes:
+        """Call a gRPC-Web method and return the protobuf message.
+
+        A rejected token is retried once with a fresh JWT, the same as
+        ``_mobile_json``. gRPC errors usually arrive with HTTP 200, so the
+        status has to be read from the headers and the trailer frame.
+        """
+
+        url = f"{BASE_MOBILE_ORIGIN}/{service}/{method}"
+        body = api_v2.build_grpc_frame(payload)
+        for attempt in range(2):
+            jwt = await self._auth.get_jwt()
+            headers = {
+                "Content-Type": "application/grpc-web+proto",
+                "Accept": "application/grpc-web+proto",
+                "x-grpc-web": "1",
+                # Raw JWT, not "Bearer <jwt>", the same as the JSON endpoints.
+                "authorization": jwt,
+                "User-Agent": _user_agent(),
+            }
+            try:
+                async with self._session.post(
+                    url, data=body, headers=headers, timeout=DEFAULT_TIMEOUT
+                ) as resp:
+                    raw = await resp.read()
+                    if resp.status == 401:
+                        status = api_v2.GRPC_STATUS_UNAUTHENTICATED
+                        message = b""
+                        detail = "HTTP 401"
+                    elif resp.status >= 400:
+                        raise BasePowerProtocolError(
+                            f"{method} returned HTTP {resp.status}"
+                        )
+                    else:
+                        message, status, detail = api_v2.read_grpc_web(
+                            raw,
+                            resp.headers.get("grpc-status"),
+                            resp.headers.get("grpc-message"),
+                        )
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                raise BasePowerConnectionError(
+                    f"network error calling {method}"
+                ) from exc
+
+            if status == api_v2.GRPC_STATUS_UNAUTHENTICATED:
+                await self._auth.reset()
+                if attempt == 0:
+                    continue
+                raise BasePowerAuthError(f"{method} rejected the token")
+            if status and status != api_v2.GRPC_STATUS_OK:
+                raise BasePowerProtocolError(
+                    f"{method} returned gRPC status {status}: {detail}"
+                )
+            return message
+        raise AssertionError("unreachable")
+
+    async def get_battery_snapshot(self, address_id: str) -> dict[str, Any]:
+        """Return battery mode, power flow, and backup hours from the v2 API."""
+
+        data = await self._grpc_web_call(
+            api_v2.BATTERY_SERVICE,
+            "GetSnapshot",
+            api_v2.encode_address_request(address_id),
+        )
+        return api_v2.parse_battery_snapshot(data)
+
+    async def get_daily_overview(
+        self, address_id: str, start: int, end: int
+    ) -> dict[str, Any]:
+        """Return the 24-hour energy mix, grid support events, and today's cost."""
+
+        data = await self._grpc_web_call(
+            api_v2.USAGE_SERVICE,
+            "GetDailyOverview",
+            api_v2.encode_address_request(address_id),
+        )
+        return api_v2.parse_daily_overview(data, start, end)
+
+    async def get_recent_grid_voltage(self, address_id: str) -> dict[str, Any]:
+        """Return the newest grid voltage from the v2 API."""
+
+        data = await self._grpc_web_call(
+            api_v2.USAGE_SERVICE,
+            "GetRecentGridVoltage",
+            api_v2.encode_address_request(address_id),
+        )
+        return api_v2.parse_recent_grid_voltage(data)
+
+    async def get_current_billing_cycle(self, address_id: str) -> dict[str, Any]:
+        """Return the bill so far and projected bill for the energy account."""
+
+        data = await self._grpc_web_call(
+            api_v2.BILLING_SERVICE,
+            "GetCurrentBillingCycle",
+            api_v2.encode_billing_cycle_request(address_id),
+        )
+        return api_v2.parse_current_billing_cycle(data)
 
     async def get_service_context(
         self, service_location_id: int
@@ -628,7 +731,10 @@ class BasePowerClient:
         * ``backup_runtime_at_750w_hours`` -- availableBackupAt750W
         * ``grid_voltage``        -- gridVoltage
         * ``home_has_power``      -- homeHasPower
-        * ``active_outage``       -- isActiveOutage
+        * ``available``           -- False when the response had no telemetry
+        * ``active_outage``       -- isActiveOutage. None when ``available`` is
+          False. Proto3 JSON leaves out false, so a missing flag in a response
+          with telemetry is a real False
         * ``active_overcurrent``  -- activeOutage.activeOvercurrent
         * ``overcurrent_limit``   -- activeOutage.overcurrentLimit
         * ``has_gateway``         -- hasGateway
@@ -657,6 +763,9 @@ class BasePowerClient:
             except (TypeError, ValueError):
                 return None
 
+        if not isinstance(resp, dict) or not _SERVICE_CONTEXT_KEYS & resp.keys():
+            return empty_service_context()
+
         power_flow = resp.get("powerFlow") or {}
         active_outage = resp.get("activeOutage") or {}
         gateway_wifi = resp.get("gatewayWifi") or {}
@@ -667,6 +776,8 @@ class BasePowerClient:
         from_solar_kw = _num(power_flow.get("fromSolar"))
 
         return {
+            "available": True,
+            "source": "service_context",
             "home_power_w": None if to_home_kw is None else to_home_kw * 1000.0,
             "power_from_grid_w": (
                 None if from_grid_kw is None else from_grid_kw * 1000.0
@@ -719,18 +830,13 @@ class BasePowerClient:
         )
         voltages = resp.get("voltage") or []
         timestamps = resp.get("timestampsTz") or []
-        latest_voltage: float | None = None
-        latest_ts: str | None = None
-        if voltages:
-            try:
-                latest_voltage = float(voltages[-1])
-            except (TypeError, ValueError):
-                latest_voltage = None
-            if timestamps:
-                latest_ts = str(timestamps[-1])
+        latest_voltage, latest_ts, latest_epoch = _newest_voltage(
+            voltages, timestamps
+        )
         return {
             "grid_voltage": latest_voltage,
             "latest_grid_voltage_ts": latest_ts,
+            "latest_grid_voltage_epoch": latest_epoch,
             "voltage_samples": list(voltages),
         }
 
@@ -814,6 +920,97 @@ class BasePowerClient:
                 for pt in resp.grid_event_data
             ],
         }
+
+
+# Any of these in a ServiceContext response means it carries telemetry.
+_SERVICE_CONTEXT_KEYS = frozenset(
+    {
+        "powerFlow",
+        "stateOfEnergyRaw",
+        "stateOfEnergy",
+        "availableBackup",
+        "availableBackupAt750W",
+        "gridVoltage",
+        "isActiveOutage",
+        "activeOutage",
+        "homeHasPower",
+        "hasGateway",
+        "gatewayConnection",
+        "gatewayWifi",
+    }
+)
+
+
+def empty_service_context() -> dict[str, Any]:
+    """Return the service context shape with every reading unknown."""
+
+    return {
+        "available": False,
+        "source": None,
+        "home_power_w": None,
+        "power_from_grid_w": None,
+        "power_from_storage_w": None,
+        "power_from_solar_w": None,
+        "state_of_energy_pct": None,
+        "state_of_energy_bucket": None,
+        "backup_runtime_hours": None,
+        "backup_runtime_at_750w_hours": None,
+        "grid_voltage": None,
+        "home_has_power": None,
+        "active_outage": None,
+        "active_overcurrent": None,
+        "active_overcurrent_standby": None,
+        "overcurrent_limit": None,
+        "outage_available_backup_hours": None,
+        "has_gateway": None,
+        "gateway_connected": None,
+        "wifi_ssid": "",
+        "wifi_state": "",
+    }
+
+
+def _parse_timestamp(value: Any) -> int | None:
+    """Return Unix seconds from an ISO 8601 string, or None."""
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def _newest_voltage(
+    voltages: list[Any], timestamps: list[Any]
+) -> tuple[float | None, str | None, int | None]:
+    """Return (volts, timestamp, epoch) for the newest sample.
+
+    Base's series ordering isn't guaranteed, so a dated sample is chosen by its
+    timestamp. Without usable timestamps this falls back to the last element
+    with a None epoch, which marks the reading as undated.
+    """
+
+    def _volts(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if not voltages:
+        return None, None, None
+    if len(voltages) == len(timestamps):
+        dated = [
+            (epoch, volts, stamp)
+            for raw, stamp in zip(voltages, timestamps)
+            if (volts := _volts(raw)) is not None
+            and (epoch := _parse_timestamp(stamp)) is not None
+        ]
+        if dated:
+            epoch, volts, stamp = max(dated, key=lambda sample: sample[0])
+            return volts, str(stamp), epoch
+    latest_ts = str(timestamps[-1]) if timestamps else None
+    return _volts(voltages[-1]), latest_ts, None
 
 
 def _coerce_bool(v: Any) -> bool | None:
