@@ -56,6 +56,7 @@ from .const import (
     EVENT_OUTAGE_ENDED,
     EVENT_OUTAGE_STARTED,
 )
+from .telemetry import clear_offline_telemetry, gateway_offline
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -147,16 +148,23 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except BasePowerError as exc:  # noqa: BLE001
             raise UpdateFailed(str(exc)) from exc
 
+        # While the gateway is offline Base still answers, but with zeros and
+        # defaults. Clear them so the entities go unavailable instead of
+        # showing 0 % or "home has no power".
+        offline = gateway_offline(context)
+        clear_offline_telemetry(context)
+
         # Base often omits gridVoltage from ServiceContext. Fall back to the
         # dedicated mobile endpoint that returns a voltage time series and
         # use the newest sample. Best-effort: never mask the primary payload.
         grid: dict[str, Any] | None = None
-        try:
-            grid = await self.client.get_grid_status(
-                location.service_location_id
-            )
-        except BasePowerError as exc:
-            _LOGGER.debug("grid_status fetch failed: %s", exc)
+        if not offline:
+            try:
+                grid = await self.client.get_grid_status(
+                    location.service_location_id
+                )
+            except BasePowerError as exc:
+                _LOGGER.debug("grid_status fetch failed: %s", exc)
 
         if grid and grid.get("grid_voltage") is not None and (
             context.get("grid_voltage") is None
@@ -167,10 +175,15 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usage = self._last_usage
         now = time.monotonic()
         usage_interval_s = self._usage_interval.total_seconds()
+        if offline:
+            # Usage totals are gateway data too. Publish none of them, and
+            # refetch as soon as the gateway is back.
+            usage = {}
+            self._last_usage_fetch = 0.0
         # ServiceContext doesn't have energy-by-source totals, so we keep a
         # slower secondary poll of MobileGetRecentUsage for the Energy
         # dashboard sensors. Defaults to 5 min (see const.py).
-        if now - self._last_usage_fetch >= usage_interval_s - 0.5:
+        if not offline and now - self._last_usage_fetch >= usage_interval_s - 0.5:
             try:
                 usage = await self.client.get_recent_usage(location.address_id)
                 self._last_usage = usage
@@ -179,7 +192,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("recent_usage fetch failed: %s", exc)
 
         self._maybe_fire_outage_event(context["active_outage"])
-        self._apply_adaptive_interval(context["active_outage"])
+        self._apply_adaptive_interval(bool(context["active_outage"]))
 
         return {
             "context": context,
@@ -206,7 +219,11 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             },
         }
 
-    def _maybe_fire_outage_event(self, active_outage: bool) -> None:
+    def _maybe_fire_outage_event(self, active_outage: bool | None) -> None:
+        # Unknown (gateway offline): keep the last known state so a gap does
+        # not fire a false outage_ended / outage_started pair.
+        if active_outage is None:
+            return
         prev = self._last_outage_state
         self._last_outage_state = active_outage
         if prev is None:
