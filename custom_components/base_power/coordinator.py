@@ -170,24 +170,19 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             context["grid_voltage"] = grid["grid_voltage"]
             context["grid_voltage_ts"] = grid.get("latest_grid_voltage_ts")
 
+        # Billing comes from Base's cloud (meter data and the billing system),
+        # not the gateway, so it keeps updating while the gateway is offline.
+        # Base refreshes it a few times a day; the usage pace is plenty.
         usage = self._last_usage
         now = time.monotonic()
         usage_interval_s = self._usage_interval.total_seconds()
-        if offline:
-            # Usage totals are gateway data too. Publish none of them, and
-            # refetch as soon as the gateway is back.
-            usage = {}
-            self._last_usage_fetch = 0.0
-        # The live status doesn't have energy-by-source totals, so we keep a
-        # slower secondary poll of MobileGetRecentUsage for the Energy
-        # dashboard sensors. Defaults to 5 min (see const.py).
-        if not offline and now - self._last_usage_fetch >= usage_interval_s - 0.5:
+        if now - self._last_usage_fetch >= usage_interval_s - 0.5:
             try:
-                usage = await self.client.get_recent_usage(location.address_id)
+                usage = await self.client.get_billing(location.address_id)
                 self._last_usage = usage
                 self._last_usage_fetch = now
             except BasePowerError as exc:
-                _LOGGER.debug("recent_usage fetch failed: %s", exc)
+                _LOGGER.debug("billing fetch failed: %s", exc)
 
         self._maybe_fire_outage_event(context["active_outage"])
         self._apply_adaptive_interval(bool(context["active_outage"]))

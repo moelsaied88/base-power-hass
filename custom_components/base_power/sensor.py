@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 from homeassistant.components.sensor import (
@@ -33,10 +34,30 @@ class BasePowerSensorDescription(SensorEntityDescription):
     """Describes a Base Power sensor and how to pull its value from data."""
 
     value_fn: Callable[[dict[str, Any]], float | int | None]
+    last_reset_fn: Callable[[dict[str, Any]], datetime | None] | None = None
 
 
 def _ctx(data: dict[str, Any]) -> dict[str, Any]:
     return data.get("context") or {}
+
+
+def _cycle(data: dict[str, Any]) -> dict[str, Any]:
+    return (data.get("usage") or {}).get("cycle") or {}
+
+
+def _cents(value: Any) -> float | None:
+    return None if value is None else round(int(value) / 100, 2)
+
+
+def _ts(value: Any) -> datetime | None:
+    return None if not value else datetime.fromtimestamp(int(value), tz=UTC)
+
+
+def _cycle_kwh(data: dict[str, Any]) -> float | None:
+    usage = data.get("usage") or {}
+    if not usage.get("cycle"):
+        return None
+    return round(sum(day["home_kwh"] for day in usage.get("days") or []), 3)
 
 
 SENSORS: tuple[BasePowerSensorDescription, ...] = (
@@ -210,46 +231,34 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda data: _full_battery_capacity_kwh(data),
     ),
-    # Energy totals from MobileGetRecentUsage. These are a *rolling window*
-    # the Base app uses for its "recent" view - the value can go DOWN as the
-    # window slides, so they are MEASUREMENT (not TOTAL_INCREASING). Do NOT
-    # plug them into the Energy Dashboard; for that, integrate the live
-    # power_from_* sensors via an Integration helper instead.
+    # Billing, straight from Base's billing system (GetCurrentBillingCycle)
+    # and meter data (GetDailyEnergy). Base's "home kWh" is the amount it
+    # bills: the meter reading less its battery adjustment, so these line
+    # up with the energy line on the bill. They reset when a new billing cycle
+    # starts, so they are TOTAL with last_reset at the cycle start. Use
+    # "Bill to Date" as the grid cost entity in the Energy Dashboard so
+    # costs there add up to the actual bills.
     BasePowerSensorDescription(
-        key="energy_grid_to_home",
-        name="Energy From Grid (window)",
-        icon="mdi:transmission-tower-export",
-        entity_registry_enabled_default=False,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
-        ).get("grid_to_home"),
+        key="bill_to_date",
+        name="Bill to Date",
+        icon="mdi:cash",
+        native_unit_of_measurement="USD",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=2,
+        value_fn=lambda data: _cents(_cycle(data).get("net_accrued_cents")),
+        last_reset_fn=lambda data: _ts(_cycle(data).get("service_period_start")),
     ),
     BasePowerSensorDescription(
-        key="energy_solar_to_home",
-        name="Energy From Solar (window)",
-        icon="mdi:solar-power",
-        entity_registry_enabled_default=False,
+        key="billed_energy_cycle",
+        name="Metered Energy This Cycle",
+        icon="mdi:meter-electric",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
-        ).get("solar_to_home"),
-    ),
-    BasePowerSensorDescription(
-        key="energy_storage_to_home",
-        name="Energy From Battery (window)",
-        icon="mdi:battery-arrow-down",
-        entity_registry_enabled_default=False,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            (data.get("usage") or {}).get("energy_source_kwh", {}) or {}
-        ).get("storage_to_home"),
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=1,
+        value_fn=lambda data: _cycle_kwh(data),
+        last_reset_fn=lambda data: _ts(_cycle(data).get("service_period_start")),
     ),
 )
 
@@ -418,6 +427,14 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
             return None
 
     @property
+    def last_reset(self) -> datetime | None:
+        fn = self.entity_description.last_reset_fn
+        data = self.coordinator.data
+        if fn is None or not data:
+            return None
+        return fn(data)
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Expose context side-channel data for select sensors."""
         data = self.coordinator.data
@@ -453,6 +470,28 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
                 "formula": "remaining_kwh / (state_of_energy_pct / 100)",
                 "remaining_kwh": _usable_battery_energy_kwh(data),
                 "state_of_energy_pct": ctx.get("state_of_energy_pct"),
+            }
+        if key in ("bill_to_date", "billed_energy_cycle"):
+            cycle = _cycle(data)
+            if not cycle:
+                return None
+            start = _ts(cycle.get("service_period_start"))
+            through = _ts(cycle.get("data_through"))
+            days = (data.get("usage") or {}).get("days") or []
+            return {
+                "source": "Base billing (GetCurrentBillingCycle, GetDailyEnergy)",
+                "service_period_start": start.isoformat() if start else None,
+                "data_through": through.isoformat() if through else None,
+                "gross_charges": _cents(cycle.get("gross_charges_cents")),
+                "solar_credit": _cents(cycle.get("solar_credit_cents")),
+                "metered_kwh": _cycle_kwh(data),
+                "daily_kwh": {
+                    datetime.fromtimestamp(int(day["start"]), tz=UTC)
+                    .astimezone()
+                    .date()
+                    .isoformat(): round(day["home_kwh"], 2)
+                    for day in days
+                },
             }
         if key == "battery_state_of_energy":
             return {

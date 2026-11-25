@@ -430,3 +430,75 @@ def estimate_soe_pct(backup_hours_750w: float | None, capacity_kwh: float | None
         return None
     pct = BACKUP_RESERVE_PERCENT + backup_hours_750w * ESTIMATE_LOAD_KW / capacity_kwh * 100
     return round(min(100.0, max(0.0, pct)), 1)
+
+
+# ---- billing -----------------------------------------------------------------
+
+ACCOUNT_TYPE_ENERGY = 1
+
+
+def _timestamp_field(field_number: int, seconds: int) -> bytes:
+    stamp = b"\x08" + encode_varint(int(seconds))
+    return encode_varint(field_number << 3 | 2) + encode_varint(len(stamp)) + stamp
+
+
+def encode_daily_energy_request(address_id: str, start: int, end: int) -> bytes:
+    """UsageService.GetDailyEnergy: 1 address_id, 2 period start, 3 period end."""
+    return encode_string_field1(address_id) + _timestamp_field(2, start) + _timestamp_field(3, end)
+
+
+def parse_daily_energy(data: bytes) -> list[dict[str, Any]]:
+    """UsageService.GetDailyEnergy: repeated (1) {1 local-midnight Timestamp,
+    2 energy_to_home_kwh, 3 solar_to_home_kwh}. Oldest first."""
+    days: list[dict[str, Any]] = []
+    for num, kind, value in iter_fields(data):
+        if num != 1 or kind != "bytes":
+            continue
+        stamp = None
+        numbers: dict[int, float] = {}
+        for sub, sub_kind, sub_value in iter_fields(value):
+            if sub == 1 and sub_kind == "bytes":
+                stamp = _timestamp_seconds(sub_value)
+            elif sub_kind == "double":
+                numbers[sub] = sub_value
+        if stamp is not None:
+            days.append(
+                {"start": stamp, "home_kwh": numbers.get(2, 0.0), "solar_kwh": numbers.get(3, 0.0)}
+            )
+    days.sort(key=lambda day: day["start"])
+    return days
+
+
+def parse_billing_cycle(data: bytes) -> dict[str, Any] | None:
+    """BillingService.GetCurrentBillingCycle: cycle (1) {1 currency,
+    2 service_period_start, 4 data_through, 5 gross_charges_cents,
+    6 solar_credit_cents, 7 net_accrued_cents, 8 projected_charges_cents}.
+    Amounts are int64 cents; proto3 omits zeros. None when there is no cycle."""
+    cycle = _first_bytes(data, 1)
+    if cycle is None:
+        return None
+    out: dict[str, Any] = {
+        "currency": None,
+        "service_period_start": None,
+        "data_through": None,
+        "gross_charges_cents": 0,
+        "solar_credit_cents": 0,
+        "net_accrued_cents": 0,
+        "projected_charges_cents": 0,
+    }
+    amounts = {
+        5: "gross_charges_cents",
+        6: "solar_credit_cents",
+        7: "net_accrued_cents",
+        8: "projected_charges_cents",
+    }
+    for num, kind, value in iter_fields(cycle):
+        if num == 1 and kind == "bytes":
+            out["currency"] = _text(value)
+        elif num == 2 and kind == "bytes":
+            out["service_period_start"] = _timestamp_seconds(value)
+        elif num == 4 and kind == "bytes":
+            out["data_through"] = _timestamp_seconds(value)
+        elif num in amounts and kind == "varint":
+            out[amounts[num]] = _int64(value)
+    return out

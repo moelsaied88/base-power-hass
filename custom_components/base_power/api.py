@@ -729,99 +729,35 @@ class BasePowerClient:
         volts, stamp = grpc_web.parse_recent_grid_voltage(data or b"")
         return {"grid_voltage": volts, "latest_grid_voltage_ts": stamp}
 
-    async def get_recent_usage(self, address_id: str) -> dict[str, Any]:
-        """Return recent time-series usage (power, energy, outage events).
+    async def get_billing(self, address_id: str, now: int | None = None) -> dict[str, Any]:
+        """Base's own billing numbers for the current cycle.
 
-        ``DashboardAPI.MobileGetRecentUsage`` over gRPC-Web, decoded with the
-        bundled descriptors.
+        * ``cycle`` -- ``BillingService.GetCurrentBillingCycle``: charges
+          accrued so far and the projected bill, in cents, straight from
+          Base's billing system (the same figures the bill is built from).
+        * ``days`` -- ``UsageService.GetDailyEnergy`` from the cycle start:
+          Base's metered kWh per local day.
         """
 
-        await self._registry()
-        request = self._message_class("dashboard.MobileGetRecentUsageRequest")(
-            address_id=address_id
+        data = await self._grpc(
+            "GetCurrentBillingCycle",
+            grpc_web.encode_account_request(address_id, grpc_web.ACCOUNT_TYPE_ENERGY),
+            service=grpc_web.V2_BILLING,
         )
-        data = await self._grpc("MobileGetRecentUsage", request.SerializeToString())
-        if data is None:
-            raise BasePowerProtocolError("MobileGetRecentUsage unavailable")
-        resp = self._message_class("dashboard.MobileGetRecentUsageResponse")()
-        try:
-            resp.ParseFromString(data)
-        except Exception as exc:  # noqa: BLE001 - protobuf DecodeError
-            raise BasePowerProtocolError(
-                f"failed to parse MobileGetRecentUsageResponse: {exc}"
-            ) from exc
-
-        def ts(pt: Any) -> int | None:
-            t = getattr(pt, "time", None) or getattr(pt, "begin_time", None)
-            if t is None:
-                return None
-            # google.protobuf.Timestamp -> epoch seconds
-            return int(t.seconds or 0)
-
-        latest_power_w: float | None = None
-        latest_power_ts: int | None = None
-        if resp.power_level_data:
-            # Don't assume list ordering - Base sometimes returns newest-first.
-            # Pick the point with the largest timestamp.
-            newest = max(
-                resp.power_level_data,
-                key=lambda pt: int(getattr(pt, "time", None).seconds)
-                if getattr(pt, "time", None) is not None
-                else 0,
+        cycle = grpc_web.parse_billing_cycle(data) if data else None
+        if cycle is None:
+            raise BasePowerProtocolError("GetCurrentBillingCycle returned no cycle")
+        days: list[dict[str, Any]] = []
+        start = cycle.get("service_period_start")
+        if start:
+            end = int(now if now is not None else time.time()) + 86400
+            data = await self._grpc(
+                "GetDailyEnergy",
+                grpc_web.encode_daily_energy_request(address_id, int(start), end),
+                service=grpc_web.V2_USAGE,
             )
-            latest_power_w = float(newest.power_to_home_kw) * 1000.0
-            if newest.HasField("time"):
-                latest_power_ts = int(newest.time.seconds)
-
-        return {
-            "latest_power_w": latest_power_w,
-            "latest_power_ts": latest_power_ts,
-            "power_level_points": [
-                {
-                    "ts": ts(pt),
-                    "power_to_home_kw": float(pt.power_to_home_kw),
-                }
-                for pt in resp.power_level_data
-            ],
-            "energy_usage_points": [
-                {
-                    "ts": ts(pt),
-                    "energy_to_home_kwh": float(pt.energy_to_home_kwh),
-                    "solar_to_home_kwh": float(pt.solar_to_home_kwh),
-                    "solar_buyback_kwh": float(pt.solar_buyback_kwh),
-                }
-                for pt in resp.energy_usage_data
-            ],
-            "energy_source_kwh": {
-                "grid_to_home": float(resp.energy_usage_source.grid_to_home_kwh),
-                "solar_to_home": float(resp.energy_usage_source.solar_to_home_kwh),
-                "storage_to_home": float(resp.energy_usage_source.storage_to_home_kwh),
-            },
-            # Base returns these as floats in HOURS (confirmed against the
-            # "Estimated duration" chart in the Base app, which is scaled in
-            # hours and shows newest values ~3h matching our 2.95h reading).
-            "latest_duration_hours": _latest_by_time(
-                resp.duration_data, "duration"
-            ),
-            "latest_duration_at_750w_hours": _latest_by_time(
-                resp.duration_data, "duration_at_750w"
-            ),
-            "duration_points": [
-                {
-                    "ts": ts(pt),
-                    "duration_hours": float(pt.duration),
-                    "duration_at_750w_hours": float(pt.duration_at_750w),
-                }
-                for pt in resp.duration_data
-            ],
-            "grid_events": [
-                {
-                    "begin_ts": int(pt.begin_time.seconds) if pt.HasField("begin_time") else None,
-                    "end_ts": int(pt.end_time.seconds) if pt.HasField("end_time") else None,
-                }
-                for pt in resp.grid_event_data
-            ],
-        }
+            days = [d for d in grpc_web.parse_daily_energy(data or b"") if d["start"] >= start - 43200]
+        return {"cycle": cycle, "days": days}
 
 
 def _coerce_bool(v: Any) -> bool | None:
