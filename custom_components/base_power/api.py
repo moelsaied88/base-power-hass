@@ -7,16 +7,17 @@ Two-layer design:
   the user enters their email, Clerk emails a 6-digit code, we exchange the
   code for a long-lived Clerk ``session_id``. Subsequent API calls mint
   short-lived JWTs via ``/v1/client/sessions/{sid}/tokens``.
-* `BasePowerClient` wraps Clerk auth and provides typed access to the mobile
-  app's JSON endpoints at `dashboard.baseapis.net/<Method>`.
+* `BasePowerClient` wraps Clerk auth and calls Base's gRPC-Web services at
+  `dashboard.baseapis.net/<service>/<Method>` (see ``grpc_web.py``). The
+  mobile REST/JSON routes were retired on 2026-11-24.
 
 Clerk's token endpoint requires the ``__client`` cookie set during sign-in.
 We capture it from the sign-in response and persist it in the config entry
 alongside ``session_id`` so JWT minting survives HA restarts.
 
-Some JSON responses are parsed into protobuf messages built at runtime from
-the FileDescriptorSet shipped inside this component (``file_descriptors.bin``)
-so field access stays typed.
+Responses covered by the FileDescriptorSet shipped inside this component
+(``file_descriptors.bin``) are decoded with it; newer v2 messages are decoded
+by field number in ``grpc_web.py``.
 
 Nothing in this module logs credentials, codes, JWTs, or full response bodies.
 """
@@ -35,7 +36,6 @@ import aiohttp
 from google.protobuf import (
     descriptor_pb2,
     descriptor_pool,
-    json_format,
     message_factory,
 )
 
@@ -43,6 +43,8 @@ try:  # protobuf 5.x
     from google.protobuf.message_factory import GetMessageClass as _get_message_class
 except ImportError:  # pragma: no cover - fallback for older protobuf
     _get_message_class = None
+
+from . import grpc_web
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -462,6 +464,11 @@ class BasePowerClient:
                 client_id=client_id,
             )
         self._pool: descriptor_pool.DescriptorPool | None = None
+        # RPC paths Base answered UNIMPLEMENTED; skipped until restart.
+        self._retired: set[str] = set()
+        self._capacity_checked = False
+        self._capacity_kwh: float | None = None
+        self.battery_sku: str | None = None
 
     @property
     def auth(self) -> _ClerkAuth:
@@ -481,267 +488,268 @@ class BasePowerClient:
         factory = message_factory.MessageFactory(self._pool)
         return factory.GetPrototype(descriptor)  # type: ignore[attr-defined]
 
-    async def _mobile_rpc(
+    async def _grpc(
         self,
-        endpoint: str,
-        response_type: str,
+        method: str,
+        payload: bytes = b"",
         *,
-        method: str = "POST",
-        body: Mapping[str, Any] | None = None,
-    ) -> Any:
-        """Call a mobile JSON endpoint and parse the reply into ``response_type``.
+        service: str = grpc_web.DASHBOARD_SERVICE,
+    ) -> bytes | None:
+        """Call one gRPC-Web RPC on the Base API host.
 
-        The mobile API speaks the protobuf JSON mapping, so the bundled
-        descriptors describe its responses exactly.
+        Returns the protobuf message bytes, or ``None`` when Base answered
+        with a non-zero gRPC status (logged at debug). A method Base reports
+        as UNIMPLEMENTED is remembered and not called again until restart.
+
+        Like the Android client, the raw Clerk JWT goes in ``authorization``
+        with no ``Bearer`` prefix. An auth rejection is retried once with a
+        freshly minted JWT before ``BasePowerAuthError`` is raised.
         """
 
-        await self._registry()
-        ResponseCls = self._message_class(response_type)
-        data = await self._mobile_json(endpoint, method=method, body=body)
+        path = f"{service}/{method}"
+        if path in self._retired:
+            return None
+        url = f"{BASE_MOBILE_ORIGIN}/{path}"
+        body = grpc_web.build_frame(payload)
+        for attempt in range(2):
+            jwt = await self._auth.get_jwt()
+            headers = {
+                "Content-Type": grpc_web.CONTENT_TYPE,
+                "x-grpc-web": "1",
+                "authorization": jwt,
+                "User-Agent": _user_agent(),
+            }
+            try:
+                async with self._session.post(
+                    url, data=body, headers=headers, timeout=DEFAULT_TIMEOUT
+                ) as resp:
+                    http_status = resp.status
+                    raw = await resp.read()
+                    message, status, detail = grpc_web.read_response(
+                        raw,
+                        resp.headers.get("grpc-status", ""),
+                        resp.headers.get("grpc-message", ""),
+                    )
+            except aiohttp.ClientError as exc:
+                raise BasePowerConnectionError(
+                    f"network error calling {method}"
+                ) from exc
 
-        resp_msg = ResponseCls()
-        try:
-            json_format.ParseDict(data, resp_msg, ignore_unknown_fields=True)
-        except json_format.ParseError as exc:
-            raise BasePowerProtocolError(
-                f"failed to parse {response_type}: {exc}"
-            ) from exc
-        return resp_msg
+            if http_status == 401 or status == grpc_web.GRPC_UNAUTHENTICATED:
+                await self._auth.reset()
+                if attempt == 0:
+                    _LOGGER.debug("%s: token rejected; retrying with a fresh one", method)
+                    continue
+                raise BasePowerAuthError(f"{method} rejected the session")
+            break
+
+        if http_status != 200:
+            raise BasePowerProtocolError(f"{method} returned HTTP {http_status}")
+        if status == grpc_web.GRPC_UNIMPLEMENTED:
+            self._retired.add(path)
+            _LOGGER.warning(
+                "Base no longer offers %s (%s); not calling it again until restart",
+                path,
+                detail or "unimplemented",
+            )
+            return None
+        if status != grpc_web.GRPC_OK:
+            _LOGGER.debug("%s failed: grpc-status=%s %s", method, status, detail)
+            return None
+        return message
 
     # ---- Typed endpoints --------------------------------------------------
 
     async def get_available_locations(self) -> list[AvailableLocation]:
         """Return the locations visible to the signed-in user.
 
-        This is step 1 of the two-step discovery - each entry has an
-        ``addressId`` but not yet a numeric ``serviceLocationId``.
+        Uses v2 ``LocationsService.ListLocations``, falling back to
+        ``DashboardAPI.GetAvailableLocations`` (address ids only).
         """
 
-        resp = await self._mobile_rpc(
-            "MobileGetAvailableLocations",
-            "dashboard.MobileGetAvailableLocationsResponse",
-            method="GET",
-        )
+        data = await self._grpc("ListLocations", service=grpc_web.V2_LOCATIONS)
+        locations = grpc_web.parse_locations(data) if data else []
+        if locations:
+            return [
+                AvailableLocation(address_id=loc["address_id"], address_display=loc["label"])
+                for loc in locations
+            ]
+        data = await self._grpc("GetAvailableLocations")
         return [
-            AvailableLocation(
-                address_id=str(loc.addressId),
-                address_display=_format_address(loc.address),
-            )
-            for loc in resp.locations
+            AvailableLocation(address_id=address_id, address_display=address_id)
+            for address_id in (grpc_web.parse_available_locations(data) if data else [])
         ]
 
-    async def resolve_service_location(self, address_id: str) -> ServiceLocation:
-        """Step 2: given an addressId, fetch the numeric serviceLocationId."""
+    async def resolve_service_location(
+        self, address_id: str, address_display: str = ""
+    ) -> ServiceLocation:
+        """Given an addressId, fetch the numeric serviceLocationId."""
 
-        resp = await self._mobile_rpc(
-            "MobileGetDashboardRoot",
-            "dashboard.MobileGetDashboardRootResponse",
-            body={"addressId": address_id, "newReferralsEnabled": False},
+        data = await self._grpc(
+            "GetDashboardRoot", grpc_web.encode_string_field1(address_id)
         )
+        root = grpc_web.parse_dashboard_root(data or b"")
+        if root["service_location_id"] is None:
+            raise BasePowerProtocolError("GetDashboardRoot returned no service location id")
         return ServiceLocation(
-            service_location_id=int(resp.serviceLocationId),
-            address_id=str(resp.addressId),
-            address_display=_format_address(resp.address),
-            has_gateway=False,  # not surfaced in mobile root response; populated later
-            has_solar=bool(getattr(resp.battery, "hasSolar", False)),
-            timezone=str(getattr(resp.address, "timezoneIdentifier", "") or ""),
+            service_location_id=root["service_location_id"],
+            address_id=address_id,
+            address_display=address_display or address_id,
+            has_gateway=False,
+            has_solar=root["has_solar"],
+            timezone=root["timezone"],
         )
 
-    async def _mobile_json(
-        self,
-        endpoint: str,
-        *,
-        method: str = "POST",
-        body: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Call a Base mobile app REST endpoint.
+    async def _battery_capacity_kwh(self, address_id: str) -> float | None:
+        """Nameplate size from the battery account's hardware SKU (cached)."""
 
-        Matches how the official Android app's ``fetchWithAuth`` wrapper
-        formats requests: ``${host}/${endpoint}`` with a raw Clerk JWT in the
-        ``authorization`` header (no ``Bearer`` prefix), JSON body.
-
-        A 401 is retried once with a freshly minted JWT: Base sometimes
-        rejects a token before our local expiry estimate, and raising
-        ``BasePowerAuthError`` makes HA stop polling and demand a new code.
-        """
-
-        url = f"{BASE_MOBILE_ORIGIN}/{endpoint}"
-        for attempt in range(2):
-            jwt = await self._auth.get_jwt()
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                # The Android client sends the raw JWT, not "Bearer <jwt>".
-                # Kept exactly the same here so our traffic pattern matches.
-                "authorization": jwt,
-                "User-Agent": _user_agent(),
-            }
-            try:
-                async with self._session.request(
-                    method,
-                    url,
-                    json=dict(body) if body is not None else None,
-                    headers=headers,
-                    timeout=DEFAULT_TIMEOUT,
-                ) as resp:
-                    if resp.status == 401:
-                        await self._auth.reset()
-                        if attempt == 0:
-                            _LOGGER.debug(
-                                "401 from %s; retrying with a fresh token",
-                                endpoint,
-                            )
-                            continue
-                        raise BasePowerAuthError(f"401 from {endpoint}")
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise BasePowerProtocolError(
-                            f"{endpoint} returned {resp.status}: {text[:200]}"
-                        )
-                    try:
-                        return await resp.json()
-                    except aiohttp.ContentTypeError as exc:
-                        raise BasePowerProtocolError(
-                            f"{endpoint} returned non-JSON body"
-                        ) from exc
-            except aiohttp.ClientError as exc:
-                raise BasePowerConnectionError(
-                    f"network error calling {endpoint}"
-                ) from exc
-        raise AssertionError("unreachable")
+        if self._capacity_checked:
+            return self._capacity_kwh
+        try:
+            data = await self._grpc(
+                "GetAccount",
+                grpc_web.encode_account_request(address_id, grpc_web.ACCOUNT_TYPE_BATTERY),
+                service=grpc_web.V2_BILLING,
+            )
+        except BasePowerConnectionError:
+            return None  # try again next poll
+        self._capacity_checked = True
+        self.battery_sku = grpc_web.parse_battery_sku(data) if data else None
+        self._capacity_kwh = grpc_web.SKU_CAPACITY_KWH.get(self.battery_sku or "")
+        if self._capacity_kwh is None:
+            _LOGGER.warning(
+                "Unknown Base battery SKU %r; battery %% is only available during outages",
+                self.battery_sku,
+            )
+        return self._capacity_kwh
 
     async def get_service_context(
-        self, service_location_id: int
+        self, service_location_id: int, address_id: str
     ) -> dict[str, Any]:
-        """Poll the live service context from the mobile API.
+        """Poll live status and return the normalized service-context dict.
 
-        This is the 1 Hz endpoint the Base Android app polls to drive its
-        Home Energy / Live view. Returns a normalized dict with:
+        Base retired ``MobileGetServiceContext`` on 2026-11-24. Its fields now
+        come from two calls:
 
-        * ``home_power_w``        -- live home load (powerFlow.toHome * 1000)
-        * ``power_from_grid_w``   -- powerFlow.fromGrid (watts)
-        * ``power_from_storage_w``-- powerFlow.fromStorage (watts)
-        * ``power_from_solar_w``  -- powerFlow.fromSolar (watts)
-        * ``state_of_energy_pct`` -- stateOfEnergyRaw (0-100 battery %)
-        * ``state_of_energy_bucket`` -- stateOfEnergy (coarse bucket)
-        * ``backup_runtime_hours``-- availableBackup at live draw
-        * ``backup_runtime_at_750w_hours`` -- availableBackupAt750W
-        * ``grid_voltage``        -- gridVoltage
-        * ``home_has_power``      -- homeHasPower
-        * ``active_outage``       -- isActiveOutage
-        * ``active_overcurrent``  -- activeOutage.activeOvercurrent
-        * ``overcurrent_limit``   -- activeOutage.overcurrentLimit
-        * ``has_gateway``         -- hasGateway
-        * ``gateway_connected``   -- gatewayConnection
-        * ``wifi_ssid`` / ``wifi_state`` -- gatewayWifi.{ssid,state}
+        * ``DashboardAPI.GetServiceStatus`` -- grid voltage, outage flag,
+          gateway link, Wi-Fi, energy bars.
+        * ``mobile.v2.BatteryService.GetSnapshot`` -- battery state, power
+          flow, backup hours, and the exact battery percent while off grid.
+
+        On grid Base no longer sends the percent, so it is estimated from the
+        750 W backup time and the battery's nameplate size
+        (``state_of_energy_source`` says which was used).
         """
 
-        resp = await self._mobile_json(
-            "MobileGetServiceContext",
-            body={"serviceLocationID": service_location_id},
+        status_data, snap_data = await asyncio.gather(
+            self._grpc(
+                "GetServiceStatus", grpc_web.encode_int_field1(service_location_id)
+            ),
+            self._grpc(
+                "GetSnapshot",
+                grpc_web.encode_string_field1(address_id),
+                service=grpc_web.V2_BATTERY,
+            ),
         )
+        status = grpc_web.parse_service_status(status_data or b"")
+        snap = grpc_web.parse_battery_snapshot(snap_data or b"")
+        if status is None and snap is None:
+            raise BasePowerProtocolError("GetServiceStatus and GetSnapshot both failed")
+        status = status or {}
+        snap = snap or {}
 
-        def _num(v: Any) -> float | None:
-            if v is None:
-                return None
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
+        state = snap.get("state")
+        flow = snap.get("power_flow") or {}
+        off_grid = state in grpc_web.OFF_GRID_STATES
 
-        def _int(v: Any) -> int | None:
-            if v is None:
-                return None
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return None
+        def _w(key: str) -> float | None:
+            kw = flow.get(key)
+            return None if kw is None else kw * 1000.0
 
-        power_flow = resp.get("powerFlow") or {}
-        active_outage = resp.get("activeOutage") or {}
-        gateway_wifi = resp.get("gatewayWifi") or {}
+        soe = snap.get("soe_pct")
+        soe_source = "snapshot" if soe is not None else None
+        if soe is None and state == "on_grid":
+            soe = grpc_web.estimate_soe_pct(
+                snap.get("backup_hours_750w"),
+                await self._battery_capacity_kwh(address_id),
+            )
+            soe_source = "backup_hours_estimate" if soe is not None else None
 
-        to_home_kw = _num(power_flow.get("toHome"))
-        from_grid_kw = _num(power_flow.get("fromGrid"))
-        from_storage_kw = _num(power_flow.get("fromStorage"))
-        from_solar_kw = _num(power_flow.get("fromSolar"))
+        if status:
+            active_outage: bool | None = bool(status.get("active_outage")) or off_grid
+            gateway_connected: bool | None = status.get("gateway_connected")
+        else:
+            active_outage = off_grid if state else None
+            gateway_connected = None
+        if state == "telemetry_unavailable":
+            gateway_connected = False
 
         return {
-            "home_power_w": None if to_home_kw is None else to_home_kw * 1000.0,
-            "power_from_grid_w": (
-                None if from_grid_kw is None else from_grid_kw * 1000.0
+            "home_power_w": _w("to_home_kw"),
+            "power_from_grid_w": _w("from_grid_kw"),
+            "power_from_storage_w": _w("from_storage_kw"),
+            "power_from_solar_w": _w("from_solar_kw"),
+            "state_of_energy_pct": None if soe is None else float(soe),
+            "state_of_energy_source": soe_source,
+            "state_of_energy_bucket": status.get("energy_bars"),
+            "backup_runtime_hours": snap.get("backup_hours"),
+            "backup_runtime_at_750w_hours": snap.get("backup_hours_750w"),
+            "grid_voltage": status.get("grid_voltage"),
+            "home_has_power": (
+                None
+                if state in (None, "telemetry_unavailable")
+                else state != "no_home_power"
             ),
-            "power_from_storage_w": (
-                None if from_storage_kw is None else from_storage_kw * 1000.0
+            "active_outage": active_outage,
+            "active_overcurrent": state == "overcurrent",
+            "active_overcurrent_standby": state == "overcurrent_standby",
+            "overcurrent_limit": snap.get("overcurrent_limit_kw"),
+            "outage_available_backup_hours": (
+                snap.get("backup_hours") if off_grid else None
             ),
-            "power_from_solar_w": (
-                None if from_solar_kw is None else from_solar_kw * 1000.0
-            ),
-            "state_of_energy_pct": _num(resp.get("stateOfEnergyRaw")),
-            "state_of_energy_bucket": _int(resp.get("stateOfEnergy")),
-            "backup_runtime_hours": _num(resp.get("availableBackup")),
-            "backup_runtime_at_750w_hours": _num(
-                resp.get("availableBackupAt750W")
-            ),
-            "grid_voltage": _num(resp.get("gridVoltage")),
-            "home_has_power": _coerce_bool(resp.get("homeHasPower")),
-            "active_outage": bool(resp.get("isActiveOutage")),
-            "active_overcurrent": bool(
-                active_outage.get("activeOvercurrent", False)
-            ),
-            "active_overcurrent_standby": bool(
-                active_outage.get("activeOvercurrentStandby", False)
-            ),
-            "overcurrent_limit": _num(active_outage.get("overcurrentLimit")),
-            "outage_available_backup_hours": _num(
-                active_outage.get("availableBackup")
-            ),
-            "has_gateway": bool(resp.get("hasGateway")),
-            "gateway_connected": _coerce_bool(resp.get("gatewayConnection")),
-            "wifi_ssid": gateway_wifi.get("ssid") or "",
-            "wifi_state": str(gateway_wifi.get("state") or ""),
+            "battery_state": state,
+            "snapshot_observed_at": snap.get("observed_at"),
+            "has_gateway": bool(status.get("has_gateway")),
+            "gateway_connected": gateway_connected,
+            "wifi_ssid": status.get("wifi_ssid") or snap.get("wifi_ssid") or "",
+            "wifi_state": status.get("wifi_state") or snap.get("wifi_state") or "",
         }
 
-    async def get_grid_status(
-        self, service_location_id: int
-    ) -> dict[str, Any]:
-        """Fetch recent grid-voltage time series.
+    async def get_grid_status(self, address_id: str) -> dict[str, Any]:
+        """Newest grid voltage from v2 ``UsageService.GetRecentGridVoltage``.
 
-        ServiceContext's ``gridVoltage`` is optional and Base often omits it,
-        so the app also polls ``MobileGetGridStatus`` at 1 Hz. This returns
-        parallel ``voltage`` and ``timestampsTz`` arrays; we just surface the
-        newest value.
+        Used when GetServiceStatus leaves the voltage out.
         """
 
-        resp = await self._mobile_json(
-            "MobileGetGridStatus",
-            body={"serviceLocationID": service_location_id},
+        data = await self._grpc(
+            "GetRecentGridVoltage",
+            grpc_web.encode_string_field1(address_id),
+            service=grpc_web.V2_USAGE,
         )
-        voltages = resp.get("voltage") or []
-        timestamps = resp.get("timestampsTz") or []
-        latest_voltage: float | None = None
-        latest_ts: str | None = None
-        if voltages:
-            try:
-                latest_voltage = float(voltages[-1])
-            except (TypeError, ValueError):
-                latest_voltage = None
-            if timestamps:
-                latest_ts = str(timestamps[-1])
-        return {
-            "grid_voltage": latest_voltage,
-            "latest_grid_voltage_ts": latest_ts,
-            "voltage_samples": list(voltages),
-        }
+        volts, stamp = grpc_web.parse_recent_grid_voltage(data or b"")
+        return {"grid_voltage": volts, "latest_grid_voltage_ts": stamp}
 
     async def get_recent_usage(self, address_id: str) -> dict[str, Any]:
-        """Return recent time-series usage (power, energy, outage events)."""
+        """Return recent time-series usage (power, energy, outage events).
 
-        resp = await self._mobile_rpc(
-            "MobileGetRecentUsage",
-            "dashboard.MobileGetRecentUsageResponse",
-            body={"addressId": address_id},
+        ``DashboardAPI.MobileGetRecentUsage`` over gRPC-Web, decoded with the
+        bundled descriptors.
+        """
+
+        await self._registry()
+        request = self._message_class("dashboard.MobileGetRecentUsageRequest")(
+            address_id=address_id
         )
+        data = await self._grpc("MobileGetRecentUsage", request.SerializeToString())
+        if data is None:
+            raise BasePowerProtocolError("MobileGetRecentUsage unavailable")
+        resp = self._message_class("dashboard.MobileGetRecentUsageResponse")()
+        try:
+            resp.ParseFromString(data)
+        except Exception as exc:  # noqa: BLE001 - protobuf DecodeError
+            raise BasePowerProtocolError(
+                f"failed to parse MobileGetRecentUsageResponse: {exc}"
+            ) from exc
 
         def ts(pt: Any) -> int | None:
             t = getattr(pt, "time", None) or getattr(pt, "begin_time", None)
