@@ -20,9 +20,8 @@ CONF_POLL_INTERVAL_USAGE: Final = "poll_interval_usage"
 
 DEFAULT_POLL_INTERVAL_GRID: Final = timedelta(seconds=5)
 DEFAULT_POLL_INTERVAL_OUTAGE: Final = timedelta(seconds=5)
-# MobileGetRecentUsage returns 15-minute energy buckets, so polling it faster
-# than a minute doesn't help. It only feeds the "Energy From X (recent)"
-# totals; live power/SoE come from MobileGetServiceContext on the grid tick.
+# Billing poll pace (GetCurrentBillingCycle + GetDailyEnergy). Base refreshes
+# these a few times a day, so a few minutes is plenty.
 DEFAULT_POLL_INTERVAL_USAGE: Final = timedelta(minutes=5)
 
 MIN_POLL_INTERVAL: Final = timedelta(seconds=5)

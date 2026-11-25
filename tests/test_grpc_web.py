@@ -263,3 +263,44 @@ def test_service_context_outage_uses_exact_percent_and_retired_calls_skip():
     asyncio.run(client.get_service_context(4321, "addr-1"))
     retired = [c for c in session.calls[before:] if "GetServiceStatus" in c[0]]
     assert retired == []
+
+
+# ---- billing ---------------------------------------------------------------------
+
+
+def test_billing_cycle_and_daily_energy():
+    cycle = (
+        text(1, "USD") + ts(2, 1_795_000_000) + ts(4, 1_795_500_000)
+        + num(5, 12_345) + num(7, 12_000) + num(8, 49_734)
+    )
+    parsed = gw.parse_billing_cycle(msg(1, cycle))
+    assert parsed["currency"] == "USD"
+    assert parsed["service_period_start"] == 1_795_000_000
+    assert parsed["net_accrued_cents"] == 12_000
+    assert parsed["solar_credit_cents"] == 0
+    assert parsed["projected_charges_cents"] == 49_734
+    assert gw.parse_billing_cycle(b"") is None
+    days = gw.parse_daily_energy(
+        msg(1, ts(1, 200) + dbl(2, 110.5)) + msg(1, ts(1, 100) + dbl(2, 98.25) + dbl(3, 1.0))
+    )
+    assert [d["start"] for d in days] == [100, 200]
+    assert days[0]["home_kwh"] == 98.25 and days[0]["solar_kwh"] == 1.0
+
+
+def test_get_billing_sums_the_cycle():
+    api = _client_module()
+    if api is None:
+        return
+    start = 1_795_000_000
+    cycle = msg(1, text(1, "USD") + ts(2, start) + num(7, 6_000) + num(8, 45_000))
+    days = msg(1, ts(1, start) + dbl(2, 100.0)) + msg(1, ts(1, start + 86400) + dbl(2, 90.0))
+    session = _FakeSession(
+        {
+            "dashboard.mobile.v2.BillingService/GetCurrentBillingCycle": grpc_body(cycle),
+            "dashboard.mobile.v2.UsageService/GetDailyEnergy": grpc_body(days),
+        }
+    )
+    client = api.BasePowerClient(session, auth=_FakeAuth())
+    billing = asyncio.run(client.get_billing("addr-1", now=start + 2 * 86400))
+    assert billing["cycle"]["net_accrued_cents"] == 6_000
+    assert sum(d["home_kwh"] for d in billing["days"]) == 190.0
