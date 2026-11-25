@@ -435,7 +435,7 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
             }
         if key == "backup_runtime":
             return {
-                "source": "MobileGetServiceContext.availableBackup",
+                "source": "BatteryService.GetSnapshot.backup_hours",
                 "backup_runtime_at_750w_hours": ctx.get(
                     "backup_runtime_at_750w_hours"
                 ),
@@ -457,5 +457,10 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
         if key == "battery_state_of_energy":
             return {
                 "bucket": ctx.get("state_of_energy_bucket"),
+                # "snapshot" = exact value from Base (sent only while off
+                # grid); "backup_hours_estimate" = derived from the 750 W
+                # backup time and the battery's nameplate size.
+                "source": ctx.get("state_of_energy_source"),
+                "battery_state": ctx.get("battery_state"),
             }
         return None

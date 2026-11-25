@@ -130,7 +130,7 @@ class BasePowerConfigFlow(ConfigFlow, domain=DOMAIN):
                         errors["base"] = "no_locations"
                     else:
                         service_location = await client.resolve_service_location(
-                            locations[0].address_id
+                            locations[0].address_id, locations[0].address_display
                         )
             except BasePowerAuthError as exc:
                 _LOGGER.debug("code verification failed: %s", exc)

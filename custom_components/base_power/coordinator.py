@@ -136,7 +136,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             location = await self._ensure_auth_and_location()
             context = await self.client.get_service_context(
-                location.service_location_id
+                location.service_location_id, location.address_id
             )
         except BasePowerAuthError as exc:
             # Clerk session expired/revoked - trigger reauth flow in the UI.
@@ -154,15 +154,13 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         offline = gateway_offline(context)
         clear_offline_telemetry(context)
 
-        # Base often omits gridVoltage from ServiceContext. Fall back to the
-        # dedicated mobile endpoint that returns a voltage time series and
-        # use the newest sample. Best-effort: never mask the primary payload.
+        # Base omits the voltage from GetServiceStatus when it has none to
+        # report. Fall back to the v2 recent-voltage series and use the newest
+        # sample. Best-effort: never mask the primary payload.
         grid: dict[str, Any] | None = None
-        if not offline:
+        if not offline and context.get("grid_voltage") is None:
             try:
-                grid = await self.client.get_grid_status(
-                    location.service_location_id
-                )
+                grid = await self.client.get_grid_status(location.address_id)
             except BasePowerError as exc:
                 _LOGGER.debug("grid_status fetch failed: %s", exc)
 
@@ -180,7 +178,7 @@ class BasePowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # refetch as soon as the gateway is back.
             usage = {}
             self._last_usage_fetch = 0.0
-        # ServiceContext doesn't have energy-by-source totals, so we keep a
+        # The live status doesn't have energy-by-source totals, so we keep a
         # slower secondary poll of MobileGetRecentUsage for the Energy
         # dashboard sensors. Defaults to 5 min (see const.py).
         if not offline and now - self._last_usage_fetch >= usage_interval_s - 0.5:

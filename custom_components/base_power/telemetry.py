@@ -1,7 +1,7 @@
 """Gateway-offline handling for the ServiceContext payload.
 
 When Base's cloud is reachable but the home gateway is offline, the cloud
-still answers MobileGetServiceContext with ``gatewayConnection`` false and
+still answers the status calls with ``gatewayConnection`` false and
 zeros or defaults for everything the gateway would have measured. Those
 values are not readings, so they are cleared here and the entities built on
 them report ``unavailable``.
@@ -22,6 +22,7 @@ TELEMETRY_KEYS: tuple[str, ...] = (
     "power_from_storage_w",
     "power_from_solar_w",
     "state_of_energy_pct",
+    "state_of_energy_source",
     "state_of_energy_bucket",
     "backup_runtime_hours",
     "backup_runtime_at_750w_hours",
