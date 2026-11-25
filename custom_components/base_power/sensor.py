@@ -232,7 +232,9 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         value_fn=lambda data: _full_battery_capacity_kwh(data),
     ),
     # Billing, straight from Base's billing system (GetCurrentBillingCycle)
-    # and meter data (GetDailyEnergy). These reset when a new billing cycle
+    # and meter data (GetDailyEnergy). Base's "home kWh" is the amount it
+    # bills: the meter reading less its battery adjustment, so these line
+    # up with the energy line on the bill. They reset when a new billing cycle
     # starts, so they are TOTAL with last_reset at the cycle start. Use
     # "Bill to Date" as the grid cost entity in the Energy Dashboard so
     # costs there add up to the actual bills.
@@ -246,15 +248,6 @@ SENSORS: tuple[BasePowerSensorDescription, ...] = (
         suggested_display_precision=2,
         value_fn=lambda data: _cents(_cycle(data).get("net_accrued_cents")),
         last_reset_fn=lambda data: _ts(_cycle(data).get("service_period_start")),
-    ),
-    BasePowerSensorDescription(
-        key="projected_bill",
-        name="Projected Bill",
-        icon="mdi:cash-clock",
-        native_unit_of_measurement="USD",
-        device_class=SensorDeviceClass.MONETARY,
-        suggested_display_precision=2,
-        value_fn=lambda data: _cents(_cycle(data).get("projected_charges_cents")),
     ),
     BasePowerSensorDescription(
         key="billed_energy_cycle",
@@ -478,7 +471,7 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
                 "remaining_kwh": _usable_battery_energy_kwh(data),
                 "state_of_energy_pct": ctx.get("state_of_energy_pct"),
             }
-        if key in ("bill_to_date", "projected_bill", "billed_energy_cycle"):
+        if key in ("bill_to_date", "billed_energy_cycle"):
             cycle = _cycle(data)
             if not cycle:
                 return None
@@ -491,9 +484,14 @@ class BasePowerSensor(CoordinatorEntity[BasePowerCoordinator], SensorEntity):
                 "data_through": through.isoformat() if through else None,
                 "gross_charges": _cents(cycle.get("gross_charges_cents")),
                 "solar_credit": _cents(cycle.get("solar_credit_cents")),
-                "projected_bill": _cents(cycle.get("projected_charges_cents")),
-                "metered_days": len(days),
                 "metered_kwh": _cycle_kwh(data),
+                "daily_kwh": {
+                    datetime.fromtimestamp(int(day["start"]), tz=UTC)
+                    .astimezone()
+                    .date()
+                    .isoformat(): round(day["home_kwh"], 2)
+                    for day in days
+                },
             }
         if key == "battery_state_of_energy":
             return {

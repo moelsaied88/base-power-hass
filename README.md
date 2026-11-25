@@ -55,6 +55,23 @@ Create one `Integration` helper per row (Settings → Devices & Services →
 Helpers → + Create Helper → Integration, Unit prefix `k`, Time unit `h`).
 The resulting kWh counters can then be selected in Settings → Energy.
 
+### Costs that match your Base bill (v0.7.7+)
+
+`sensor.base_power_bill_to_date` is the energy charge accrued so far this
+billing cycle, read straight from Base's billing system. It uses the same
+metered kWh, the same battery adjustment, and the same rates, fixed fees,
+and taxes as your monthly bill. In Settings → Energy → Grid consumption,
+choose **Use an entity tracking the total costs** and pick this sensor.
+Energy Dashboard costs then add up to your bills. A fixed price per kWh
+can't, because the bill also has a fixed monthly fee and a battery credit.
+
+`sensor.base_power_metered_energy_this_cycle` is Base's metered kWh for the
+cycle, the number your bill is based on. Its `daily_kwh` attribute lists each
+day.
+
+Base posts these numbers about an hour behind real time. The $29 battery
+membership is a separate bill and isn't included.
+
 ### Legacy: meter-level sensors
 
 The raw `power_from_grid` / `power_from_battery` / `power_to_battery` /
